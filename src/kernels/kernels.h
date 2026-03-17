@@ -179,6 +179,16 @@ void head_untranspose_bf16(
     const __nv_bfloat16* src, __nv_bfloat16* dst,
     int H, int T, int HD, cudaStream_t stream = 0);
 
+// ---- Batched Head Transpose: [B*S, H*HD] -> [B, H, S, HD] ----
+void head_transpose_batched_bf16(
+    const __nv_bfloat16* src, __nv_bfloat16* dst,
+    int B, int H, int S, int HD, cudaStream_t stream = 0);
+
+// ---- Batched Head Untranspose: [B, H, S, HD] -> [B*S, H*HD] ----
+void head_untranspose_batched_bf16(
+    const __nv_bfloat16* src, __nv_bfloat16* dst,
+    int B, int H, int S, int HD, cudaStream_t stream = 0);
+
 // ---- Patchify 3D: [B, C, T, H, W] -> [B, S, patch_dim] ----
 void patchify_3d_bf16(
     const __nv_bfloat16* src, __nv_bfloat16* dst,

@@ -61,13 +61,21 @@ add_library(anima_core STATIC
     src/vae.cpp
     src/qwen3_tokenizer.cpp
     src/t5_tokenizer.cpp
+    src/cudnn_sdpa.cpp
 )
-target_include_directories(anima_core PUBLIC ${CMAKE_SOURCE_DIR}/src ${SENTENCEPIECE_INCLUDE})
+target_include_directories(anima_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    /home/parsa/sglang/.venv/lib/python3.13/site-packages/include
+    ${SENTENCEPIECE_INCLUDE}
+    ${CUDNN_INCLUDE}
+)
 target_link_libraries(anima_core PUBLIC
     anima_kernels
     third_party
     CUDA::cublas
     CUDA::curand
+    ${CUDNN_LIB}
     ${SENTENCEPIECE_LIB}
 )
 

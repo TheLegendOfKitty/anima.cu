@@ -3,7 +3,9 @@
 #include "anima.h"
 #include "tensor.h"
 #include "linear.h"
+#include "cudnn_sdpa.h"
 #include <cublas_v2.h>
+#include <cudnn.h>
 #include <vector>
 
 // CosmosTransformer3DModel for Anima diffusion.
@@ -72,6 +74,8 @@ public:
 
 private:
     cublasHandle_t cublas_ = nullptr;
+    cudnnHandle_t cudnn_ = nullptr;
+    CudnnSDPA sdpa_;
 
     // Patch embedding
     Linear patch_proj_;  // [2048, 68] (17 channels * 1*2*2 patch)
@@ -110,8 +114,6 @@ private:
         Tensor q_h;          // [H, S, HD] BF16
         Tensor k_h;          // [H, max_kv, HD] BF16
         Tensor v_h;          // [H, max_kv, HD] BF16
-        Tensor scores;       // [H, S, max_kv] F32
-        Tensor scores_bf16;  // [H, S, max_kv] BF16
         Tensor attn_out;     // [H, S, HD] BF16
         Tensor attn_flat;    // [S, D] BF16
 
@@ -149,6 +151,7 @@ private:
                         __nv_bfloat16* hidden, int S,
                         const __nv_bfloat16* encoder_cond, int S_text,
                         const __nv_bfloat16* temb,
+                        int batch_size,
                         cudaStream_t stream);
 
     // Attention sub-layer using pre-allocated scratch buffers.
@@ -159,5 +162,6 @@ private:
                        const __nv_bfloat16* kv_input, int T_kv,
                        __nv_bfloat16* output,
                        bool apply_rope,
+                       int batch_size,
                        cudaStream_t stream);
 };

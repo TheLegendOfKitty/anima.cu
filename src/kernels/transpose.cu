@@ -66,6 +66,64 @@ void head_untranspose_bf16(
     head_untranspose_kernel<<<blocks, threads, 0, stream>>>(src, dst, H, T, HD);
 }
 
+// ========================= Batched Head Transpose =========================
+
+// [B*S, H*HD] -> [B, H, S, HD]
+// src[b*S + s, h*HD + d] -> dst[b, h, s, d] = dst[(b*H + h)*S*HD + s*HD + d]
+__global__ void head_transpose_batched_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ dst,
+    int B, int H, int S, int HD) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * S * HD;
+    if (idx >= total) return;
+
+    int d  = idx % HD;
+    int s  = (idx / HD) % S;
+    int h  = (idx / (HD * S)) % H;
+    int b  = idx / (HD * S * H);
+
+    int64_t src_idx = ((int64_t)b * S + s) * H * HD + (int64_t)h * HD + d;
+    dst[idx] = src[src_idx];
+}
+
+void head_transpose_batched_bf16(
+    const __nv_bfloat16* src, __nv_bfloat16* dst,
+    int B, int H, int S, int HD, cudaStream_t stream) {
+    int64_t total = (int64_t)B * H * S * HD;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    head_transpose_batched_kernel<<<blocks, threads, 0, stream>>>(src, dst, B, H, S, HD);
+}
+
+// [B, H, S, HD] -> [B*S, H*HD]
+// src[b, h, s, d] -> dst[b*S + s, h*HD + d]
+__global__ void head_untranspose_batched_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ dst,
+    int B, int H, int S, int HD) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * S * HD;
+    if (idx >= total) return;
+
+    int d  = idx % HD;
+    int s  = (idx / HD) % S;
+    int h  = (idx / (HD * S)) % H;
+    int b  = idx / (HD * S * H);
+
+    int64_t dst_idx = ((int64_t)b * S + s) * H * HD + (int64_t)h * HD + d;
+    dst[dst_idx] = src[idx];
+}
+
+void head_untranspose_batched_bf16(
+    const __nv_bfloat16* src, __nv_bfloat16* dst,
+    int B, int H, int S, int HD, cudaStream_t stream) {
+    int64_t total = (int64_t)B * H * S * HD;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    head_untranspose_batched_kernel<<<blocks, threads, 0, stream>>>(src, dst, B, H, S, HD);
+}
+
 // ========================= Patchify 3D =========================
 
 // [B, C, T, H, W] -> [B, S, C*pT*pH*pW]

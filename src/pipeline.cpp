@@ -124,9 +124,10 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
     bool use_ancestral = (opts_.sampler == "euler_a_rf");
 
     // Pre-allocate output buffers for forward() — reused across all denoising steps.
-    // Each forward() writes into its own buffer so pos/neg results coexist.
     Tensor noise_pos({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
     Tensor noise_neg({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
+    auto* noise_pos_ptr = noise_pos.bf16_ptr();
+    auto* noise_neg_ptr = noise_neg.bf16_ptr();
 
     // Pre-allocate noise buffers for ancestral sampler
     Tensor rand_noise;
@@ -148,12 +149,10 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
 
         transformer_.forward(latents, sigma,
                              pos_cond.bf16_ptr(), S_text,
-                             1, latent_h, latent_w,
-                             noise_pos.bf16_ptr());
+                             1, latent_h, latent_w, noise_pos_ptr);
         transformer_.forward(latents, sigma,
                              neg_cond.bf16_ptr(), S_text,
-                             1, latent_h, latent_w,
-                             noise_neg.bf16_ptr());
+                             1, latent_h, latent_w, noise_neg_ptr);
 
         if (use_ancestral && sigma_next > 0.0f) {
             // Generate fresh noise for this step (reuse pre-allocated noise_f32)
@@ -161,18 +160,17 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
             f32_to_bf16(noise_f32.f32_ptr(), rand_noise.bf16_ptr(), numel);
 
             cfg_euler_a_rf_step_bf16(
-                latents.bf16_ptr(), noise_pos.bf16_ptr(), noise_neg.bf16_ptr(),
+                latents.bf16_ptr(), noise_pos_ptr, noise_neg_ptr,
                 rand_noise.bf16_ptr(), latents.bf16_ptr(),
                 guidance_scale, sigma, sigma_next,
                 opts_.eta, opts_.s_noise, numel, 0);
         } else {
             // Plain Euler (or last step of ancestral)
             if (use_ancestral && sigma_next == 0.0f) {
-                // Last step: just compute denoised = sample - sigma * noise
-                cfg_euler_step_bf16(latents.bf16_ptr(), noise_pos.bf16_ptr(), noise_neg.bf16_ptr(),
+                cfg_euler_step_bf16(latents.bf16_ptr(), noise_pos_ptr, noise_neg_ptr,
                                     latents.bf16_ptr(), guidance_scale, sigma, 0.0f, numel, 0);
             } else {
-                cfg_euler_step_bf16(latents.bf16_ptr(), noise_pos.bf16_ptr(), noise_neg.bf16_ptr(),
+                cfg_euler_step_bf16(latents.bf16_ptr(), noise_pos_ptr, noise_neg_ptr,
                                     latents.bf16_ptr(), guidance_scale, sigma, sigma_next, numel, 0);
             }
         }
