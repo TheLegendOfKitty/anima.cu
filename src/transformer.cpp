@@ -402,52 +402,60 @@ void CosmosTransformer::forward_block(
         add_bf16(mod, temb, mod, 3 * D, stream);
     };
 
-    // Helper: apply adaLN modulation (BS rows)
-    auto apply_adaln = [&](const __nv_bfloat16* x) {
-        const __nv_bfloat16* shift = mod;
-        const __nv_bfloat16* scale = mod + D;
-        const __nv_bfloat16* g = mod + 2 * D;
-
-        layer_norm_bf16(x, normed, BS, D, 1e-6f, stream);
-        scale_shift_bcast_bf16(normed, scale, shift, normed, BS, D, stream);
-
-        CUDA_CHECK(cudaMemcpyAsync(gate, g, D * sizeof(__nv_bfloat16),
-                                    cudaMemcpyDeviceToDevice, stream));
+    // Helper: extract adaLN shift/scale/gate pointers from mod buffer
+    auto get_adaln_ptrs = [&]() {
+        return std::make_tuple(mod, mod + D, mod + 2 * D);  // shift, scale, gate
     };
 
     // --- Block execution ---
 
     // 1. Self-attention with adaLN-Zero
     compute_adaln_zero(B.norm1);
-    apply_adaln(hidden);
+    {
+        auto [shift, scale, g] = get_adaln_ptrs();
+        // Fused: LayerNorm(hidden) * (1+scale) + shift → normed
+        adaln_layernorm_bf16(hidden, scale, shift, normed, BS, D, 1e-6f, stream);
+        CUDA_CHECK(cudaMemcpyAsync(gate, g, D * sizeof(__nv_bfloat16),
+                                    cudaMemcpyDeviceToDevice, stream));
+    }
 
     run_attention(B.sa_q_proj, B.sa_k_proj, B.sa_v_proj, B.sa_o_proj,
                   B.sa_q_norm, B.sa_k_norm,
                   normed, S, normed, S,
                   sub_out, true, batch_size, stream);
 
-    residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, BS, D, stream);
-
-    // 2. Cross-attention with adaLN-Zero
+    // 2. Cross-attention: fuse residual_gate + adaLN of sub-layer 2
     compute_adaln_zero(B.norm2);
-    apply_adaln(hidden);
+    {
+        auto [shift, scale, g] = get_adaln_ptrs();
+        // Fused: hidden += sub_out * gate; normed = adaLN(hidden)
+        residual_gate_adaln_bf16(hidden, sub_out, gate, scale, shift,
+                                  normed, BS, D, 1e-6f, stream);
+        CUDA_CHECK(cudaMemcpyAsync(gate, g, D * sizeof(__nv_bfloat16),
+                                    cudaMemcpyDeviceToDevice, stream));
+    }
 
     run_attention(B.ca_q_proj, B.ca_k_proj, B.ca_v_proj, B.ca_o_proj,
                   B.ca_q_norm, B.ca_k_norm,
                   normed, S, encoder_cond, S_text,
                   sub_out, false, batch_size, stream);
 
-    residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, BS, D, stream);
-
-    // 3. Feed-forward with adaLN-Zero
+    // 3. FFN: fuse residual_gate + adaLN of sub-layer 3
     compute_adaln_zero(B.norm3);
-    apply_adaln(hidden);
+    {
+        auto [shift, scale, g] = get_adaln_ptrs();
+        residual_gate_adaln_bf16(hidden, sub_out, gate, scale, shift,
+                                  normed, BS, D, 1e-6f, stream);
+        CUDA_CHECK(cudaMemcpyAsync(gate, g, D * sizeof(__nv_bfloat16),
+                                    cudaMemcpyDeviceToDevice, stream));
+    }
 
     auto* ff_buf = scratch_.ff_buf.bf16_ptr();
     B.ff_proj1.forward(cublas_, normed, ff_buf, BS, stream);
     gelu_tanh_bf16(ff_buf, ff_buf, (int64_t)BS * MLP_DIM, stream);
     B.ff_proj2.forward(cublas_, ff_buf, sub_out, BS, stream);
 
+    // Final residual of this block (no subsequent adaLN to fuse with)
     residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, BS, D, stream);
 }
 

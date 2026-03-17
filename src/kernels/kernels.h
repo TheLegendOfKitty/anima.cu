@@ -15,6 +15,20 @@ void layer_norm_bf16(
     const __nv_bfloat16* x, __nv_bfloat16* out,
     int N, int D, float eps = 1e-6f, cudaStream_t stream = 0);
 
+// ---- Fused adaLN: LayerNorm(x) * (1+scale) + shift ----
+void adaln_layernorm_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    __nv_bfloat16* out, int N, int D, float eps = 1e-6f, cudaStream_t stream = 0);
+
+// ---- Fused residual_gate + adaLN: hidden += sub_out * gate; normed = adaLN(hidden) ----
+void residual_gate_adaln_bf16(
+    __nv_bfloat16* hidden,
+    const __nv_bfloat16* sub_out, const __nv_bfloat16* gate,
+    const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    __nv_bfloat16* normed,
+    int N, int D, float eps = 1e-6f, cudaStream_t stream = 0);
+
 // ---- GELU(tanh) ----
 void gelu_tanh_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int64_t N, cudaStream_t stream = 0);
 void gelu_tanh_bias_bf16(
