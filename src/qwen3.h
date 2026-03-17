@@ -53,9 +53,32 @@ private:
     Tensor final_norm_weight_;  // [1024]
     std::vector<Qwen3Layer> layers_;
 
-    // Scratch buffers (reused across layers)
-    mutable Tensor x_buf_, norm_buf_;
-    mutable Tensor q_buf_, k_buf_, v_buf_;
+    // ---- Pre-allocated scratch buffers (reused across all 28 layers) ----
+    struct Scratch {
+        Tensor norm_buf;     // [T, D]
+        Tensor q_buf;        // [T, QD]
+        Tensor k_buf;        // [T, KVD]
+        Tensor v_buf;        // [T, KVD]
+        Tensor q_heads;      // [QH, T, HD]
+        Tensor k_heads;      // [KVH, T, HD]
+        Tensor v_heads;      // [KVH, T, HD]
+        Tensor k_expanded;   // [QH, T, HD]
+        Tensor v_expanded;   // [QH, T, HD]
+        Tensor scores;       // [QH, T, T] BF16
+        Tensor attn_out;     // [QH, T, HD]
+        Tensor attn_flat;    // [T, QD]
+        Tensor o_out;        // [T, D]
+        Tensor gate_buf;     // [T, INTER]
+        Tensor up_buf;       // [T, INTER]
+        Tensor mlp_out;      // [T, D]
+        int T = 0;
+    } scratch_;
+
+    void ensure_scratch(int T);
+
+    // ---- RoPE cache (reused if T unchanged) ----
+    Tensor rope_cos_cache_, rope_sin_cache_;
+    int rope_cache_T_ = 0;
 
     void forward_layer(int layer_idx, __nv_bfloat16* x, int T,
                        const float* cos_cache, const float* sin_cache,

@@ -129,6 +129,12 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     scratch_.silu_ts = Tensor({(int64_t)D}, DType::BF16);
     scratch_.adaln_mid = Tensor({(int64_t)ADALN_DIM}, DType::BF16);
 
+    // Timestep embedding buffers (reused across denoising steps)
+    scratch_.embedded_ts = Tensor({(int64_t)D}, DType::BF16);
+    scratch_.temb = Tensor({6144}, DType::BF16);
+    scratch_.ts_sin_buf = Tensor({(int64_t)D}, DType::BF16);
+    scratch_.ts_mlp_buf = Tensor({(int64_t)D}, DType::BF16);
+
     scratch_.S = S;
     scratch_.S_text = S_text;
 
@@ -142,6 +148,8 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     add(scratch_.scores); add(scratch_.scores_bf16);
     add(scratch_.attn_out); add(scratch_.attn_flat);
     add(scratch_.silu_ts); add(scratch_.adaln_mid);
+    add(scratch_.embedded_ts); add(scratch_.temb);
+    add(scratch_.ts_sin_buf); add(scratch_.ts_mlp_buf);
     fprintf(stderr, "[transformer] scratch memory: %.1f MB\n", total / (1024.0 * 1024.0));
 }
 
@@ -163,24 +171,24 @@ void CosmosTransformer::compute_timestep_embedding(
         sinusoidal[half_dim + i] = std::sin(angle);
     }
 
-    // Upload sinusoidal to GPU as BF16
-    Tensor sin_gpu({(int64_t)D}, DType::BF16);
+    // Upload sinusoidal to GPU as BF16 (reuse scratch buffer)
+    auto* sin_buf = scratch_.ts_sin_buf.bf16_ptr();
     {
         std::vector<__nv_bfloat16> sin_bf16(D);
         for (int i = 0; i < D; i++) sin_bf16[i] = __float2bfloat16(sinusoidal[i]);
-        sin_gpu.copy_from_host(sin_bf16.data(), D * sizeof(__nv_bfloat16));
+        scratch_.ts_sin_buf.copy_from_host(sin_bf16.data(), D * sizeof(__nv_bfloat16));
     }
 
     // 2. RMSNorm(sinusoidal) -> embedded_timestep [D]
-    rms_norm_bf16(sin_gpu.bf16_ptr(), time_norm_weight_.bf16_ptr(),
+    rms_norm_bf16(sin_buf, time_norm_weight_.bf16_ptr(),
                   embedded_ts, 1, D, 1e-6f, stream);
 
     // 3. TimestepEmbedding MLP: Linear(D, D) -> SiLU -> Linear(D, TEMB_DIM)
     // Input is raw sinusoidal (not normed)
-    Tensor mlp_buf({(int64_t)D}, DType::BF16);
-    time_linear_1_.forward(cublas_, sin_gpu.bf16_ptr(), mlp_buf.bf16_ptr(), 1, stream);
-    silu_bf16(mlp_buf.bf16_ptr(), mlp_buf.bf16_ptr(), D, stream);
-    time_linear_2_.forward(cublas_, mlp_buf.bf16_ptr(), temb, 1, stream);
+    auto* mlp_buf = scratch_.ts_mlp_buf.bf16_ptr();
+    time_linear_1_.forward(cublas_, sin_buf, mlp_buf, 1, stream);
+    silu_bf16(mlp_buf, mlp_buf, D, stream);
+    time_linear_2_.forward(cublas_, mlp_buf, temb, 1, stream);
 }
 
 // ========================= 3D RoPE (cached) =========================
@@ -502,13 +510,13 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
     Tensor hidden({(int64_t)(batch_size * S), (int64_t)D}, DType::BF16);
     patch_proj_.forward(cublas_, patches.bf16_ptr(), hidden.bf16_ptr(), batch_size * S, stream);
 
-    // 4. Compute timestep embedding
-    Tensor embedded_ts({(int64_t)D}, DType::BF16);
-    Tensor temb({6144}, DType::BF16);
-    compute_timestep_embedding(timestep, embedded_ts.bf16_ptr(), temb.bf16_ptr(), stream);
+    // 4. Compute timestep embedding (uses scratch buffers internally)
+    auto* embedded_ts = scratch_.embedded_ts.bf16_ptr();
+    auto* temb = scratch_.temb.bf16_ptr();
+    compute_timestep_embedding(timestep, embedded_ts, temb, stream);
 
     // 5. Pre-compute SiLU(embedded_ts) once (reused 84+ times across 28 blocks)
-    CUDA_CHECK(cudaMemcpyAsync(scratch_.silu_ts.bf16_ptr(), embedded_ts.bf16_ptr(),
+    CUDA_CHECK(cudaMemcpyAsync(scratch_.silu_ts.bf16_ptr(), embedded_ts,
                                 D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
     silu_bf16(scratch_.silu_ts.bf16_ptr(), scratch_.silu_ts.bf16_ptr(), D, stream);
 
@@ -516,27 +524,28 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
     for (int i = 0; i < COSMOS_LAYERS; i++) {
         forward_block(i, hidden.bf16_ptr(), S,
                       encoder_cond, S_text,
-                      temb.bf16_ptr(), stream);
+                      temb, stream);
 
         if ((i + 1) % 10 == 0) {
             fprintf(stderr, "[transformer]   block %d/%d done\n", i + 1, COSMOS_LAYERS);
         }
     }
 
-    // 7. Output norm (also uses pre-computed silu_ts)
+    // 7. Output norm (reuses scratch buffers — adaln_mid and mod are free after block loop)
     {
-        Tensor adaln_mid({(int64_t)COSMOS_ADALN_DIM}, DType::BF16);
-        output_norm_.linear_1.forward(cublas_, scratch_.silu_ts.bf16_ptr(), adaln_mid.bf16_ptr(), 1, stream);
+        auto* adaln_mid = scratch_.adaln_mid.bf16_ptr();
+        output_norm_.linear_1.forward(cublas_, scratch_.silu_ts.bf16_ptr(), adaln_mid, 1, stream);
 
-        Tensor mod_4096({4096}, DType::BF16);
-        output_norm_.linear_2.forward(cublas_, adaln_mid.bf16_ptr(), mod_4096.bf16_ptr(), 1, stream);
+        // Reuse first 4096 elements of scratch_.mod (which is 6144 — blocks are done)
+        auto* mod_4096 = scratch_.mod.bf16_ptr();
+        output_norm_.linear_2.forward(cublas_, adaln_mid, mod_4096, 1, stream);
 
         // Add first 4096 elements of temb (temb is 6144-dim, output norm uses 4096)
-        add_bf16(mod_4096.bf16_ptr(), temb.bf16_ptr(), mod_4096.bf16_ptr(), 4096, stream);
+        add_bf16(mod_4096, temb, mod_4096, 4096, stream);
 
         // Split into shift[D], scale[D]
-        const __nv_bfloat16* shift = mod_4096.bf16_ptr();
-        const __nv_bfloat16* scale = mod_4096.bf16_ptr() + D;
+        const __nv_bfloat16* shift = mod_4096;
+        const __nv_bfloat16* scale = mod_4096 + D;
 
         layer_norm_bf16(hidden.bf16_ptr(), hidden.bf16_ptr(), S, D, 1e-6f, stream);
         scale_shift_bcast_bf16(hidden.bf16_ptr(), scale, shift, hidden.bf16_ptr(), S, D, stream);

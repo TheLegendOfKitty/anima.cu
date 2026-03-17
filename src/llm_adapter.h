@@ -64,6 +64,26 @@ private:
     Linear out_proj_;
     Tensor norm_weight_;   // [1024]
 
+    // ---- Pre-allocated scratch buffers (reused across 6 blocks) ----
+    struct Scratch {
+        Tensor q_buf, k_buf, v_buf;         // attention projections
+        Tensor q_heads, k_heads, v_heads;   // head-transposed
+        Tensor scores;                       // [H, T_q, max_kv]
+        Tensor attn_out;                     // [H, T_q, HD]
+        Tensor attn_flat;                    // [T_q, D] untransposed output
+        Tensor norm_buf;                     // [max(T_src, T_tgt), D]
+        Tensor attn_buf;                     // [max(T_src, T_tgt), D]
+        Tensor mlp_buf;                      // [T_tgt, 4096]
+        Tensor mlp_out;                      // [T_tgt, D]
+        int T_src = 0, T_tgt = 0;
+    } scratch_;
+
+    void ensure_scratch(int T_src, int T_tgt);
+
+    // ---- RoPE cache (reused if max_len unchanged) ----
+    Tensor rope_cos_cache_, rope_sin_cache_;
+    int rope_cache_len_ = 0;
+
     // Run attention sublayer
     void run_attention(const AdapterAttention& attn,
                        const __nv_bfloat16* query_in, int T_q,

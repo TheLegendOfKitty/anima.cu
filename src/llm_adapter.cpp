@@ -94,6 +94,49 @@ void LLMAdapter::load(const SafeTensorsFile& file) {
     fprintf(stderr, "[adapter] loaded\n");
 }
 
+// ========================= ensure_scratch =========================
+
+void LLMAdapter::ensure_scratch(int T_src, int T_tgt) {
+    if (T_src <= scratch_.T_src && T_tgt <= scratch_.T_tgt) return;  // high-water-mark
+    T_src = std::max(T_src, scratch_.T_src);
+    T_tgt = std::max(T_tgt, scratch_.T_tgt);
+
+    constexpr int D = ADAPTER_DIM;       // 1024
+    constexpr int H = ADAPTER_HEADS;     // 16
+    constexpr int HD = ADAPTER_HEAD_DIM; // 64
+    constexpr int MLP_DIM = 4096;
+
+    int max_kv = std::max(T_src, T_tgt);
+
+    fprintf(stderr, "[adapter] allocating scratch buffers: T_src=%d, T_tgt=%d\n", T_src, T_tgt);
+
+    scratch_.q_buf = Tensor({(int64_t)T_tgt, (int64_t)D}, DType::BF16);
+    scratch_.k_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.v_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.q_heads = Tensor({(int64_t)H, (int64_t)T_tgt, (int64_t)HD}, DType::BF16);
+    scratch_.k_heads = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
+    scratch_.v_heads = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
+    scratch_.scores = Tensor({(int64_t)H, (int64_t)T_tgt, (int64_t)max_kv}, DType::BF16);
+    scratch_.attn_out = Tensor({(int64_t)H, (int64_t)T_tgt, (int64_t)HD}, DType::BF16);
+    scratch_.attn_flat = Tensor({(int64_t)T_tgt, (int64_t)D}, DType::BF16);
+    scratch_.norm_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.attn_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.mlp_buf = Tensor({(int64_t)T_tgt, (int64_t)MLP_DIM}, DType::BF16);
+    scratch_.mlp_out = Tensor({(int64_t)T_tgt, (int64_t)D}, DType::BF16);
+
+    scratch_.T_src = T_src;
+    scratch_.T_tgt = T_tgt;
+
+    size_t total = 0;
+    auto add = [&](const Tensor& t) { total += t.size_bytes(); };
+    add(scratch_.q_buf); add(scratch_.k_buf); add(scratch_.v_buf);
+    add(scratch_.q_heads); add(scratch_.k_heads); add(scratch_.v_heads);
+    add(scratch_.scores); add(scratch_.attn_out); add(scratch_.attn_flat);
+    add(scratch_.norm_buf); add(scratch_.attn_buf);
+    add(scratch_.mlp_buf); add(scratch_.mlp_out);
+    fprintf(stderr, "[adapter] scratch memory: %.1f MB\n", total / (1024.0 * 1024.0));
+}
+
 // ========================= Attention =========================
 
 void LLMAdapter::run_attention(const AdapterAttention& attn,
@@ -109,79 +152,75 @@ void LLMAdapter::run_attention(const AdapterAttention& attn,
 
     CUBLAS_CHECK(cublasSetStream(cublas_, stream));
 
-    // QKV projections
-    Tensor q_buf({(int64_t)T_q, (int64_t)D}, DType::BF16);
-    Tensor k_buf({(int64_t)T_kv, (int64_t)D}, DType::BF16);
-    Tensor v_buf({(int64_t)T_kv, (int64_t)D}, DType::BF16);
+    // Use pre-allocated scratch buffers
+    auto* q_buf = scratch_.q_buf.bf16_ptr();
+    auto* k_buf = scratch_.k_buf.bf16_ptr();
+    auto* v_buf = scratch_.v_buf.bf16_ptr();
+    auto* q_heads = scratch_.q_heads.bf16_ptr();
+    auto* k_heads = scratch_.k_heads.bf16_ptr();
+    auto* v_heads = scratch_.v_heads.bf16_ptr();
 
-    attn.q_proj.forward(cublas_, query_in, q_buf.bf16_ptr(), T_q, stream);
-    attn.k_proj.forward(cublas_, kv_in, k_buf.bf16_ptr(), T_kv, stream);
-    attn.v_proj.forward(cublas_, kv_in, v_buf.bf16_ptr(), T_kv, stream);
+    // QKV projections
+    attn.q_proj.forward(cublas_, query_in, q_buf, T_q, stream);
+    attn.k_proj.forward(cublas_, kv_in, k_buf, T_kv, stream);
+    attn.v_proj.forward(cublas_, kv_in, v_buf, T_kv, stream);
 
     // Reshape [T, H*HD] -> [H, T, HD]
-    Tensor q_heads({(int64_t)H, (int64_t)T_q, (int64_t)HD}, DType::BF16);
-    Tensor k_heads({(int64_t)H, (int64_t)T_kv, (int64_t)HD}, DType::BF16);
-    Tensor v_heads({(int64_t)H, (int64_t)T_kv, (int64_t)HD}, DType::BF16);
-
-    head_transpose_bf16(q_buf.bf16_ptr(), q_heads.bf16_ptr(), H, T_q, HD, stream);
-    head_transpose_bf16(k_buf.bf16_ptr(), k_heads.bf16_ptr(), H, T_kv, HD, stream);
-    head_transpose_bf16(v_buf.bf16_ptr(), v_heads.bf16_ptr(), H, T_kv, HD, stream);
+    head_transpose_bf16(q_buf, q_heads, H, T_q, HD, stream);
+    head_transpose_bf16(k_buf, k_heads, H, T_kv, HD, stream);
+    head_transpose_bf16(v_buf, v_heads, H, T_kv, HD, stream);
 
     // Per-head QK norm
-    rms_norm_bf16(q_heads.bf16_ptr(), attn.q_norm_weight.bf16_ptr(),
-                  q_heads.bf16_ptr(), H * T_q, HD, 1e-6f, stream);
-    rms_norm_bf16(k_heads.bf16_ptr(), attn.k_norm_weight.bf16_ptr(),
-                  k_heads.bf16_ptr(), H * T_kv, HD, 1e-6f, stream);
+    rms_norm_bf16(q_heads, attn.q_norm_weight.bf16_ptr(),
+                  q_heads, H * T_q, HD, 1e-6f, stream);
+    rms_norm_bf16(k_heads, attn.k_norm_weight.bf16_ptr(),
+                  k_heads, H * T_kv, HD, 1e-6f, stream);
 
     // Apply RoPE
     if (cos_q && sin_q) {
-        rope_standard_bf16(q_heads.bf16_ptr(), cos_q, sin_q,
+        rope_standard_bf16(q_heads, cos_q, sin_q,
                            H * T_q, T_q, HD, stream);
     }
     if (cos_k && sin_k) {
-        rope_standard_bf16(k_heads.bf16_ptr(), cos_k, sin_k,
+        rope_standard_bf16(k_heads, cos_k, sin_k,
                            H * T_kv, T_kv, HD, stream);
     }
 
     // Attention: scores = Q @ K^T / sqrt(HD)
     float scale = 1.0f / std::sqrt((float)HD);
-    Tensor scores({(int64_t)H, (int64_t)T_q, (int64_t)T_kv}, DType::BF16);
+    auto* scores = scratch_.scores.bf16_ptr();
     {
         float alpha = scale, beta = 0.0f;
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(
             cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
             T_kv, T_q, HD, &alpha,
-            k_heads.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_kv * HD,
-            q_heads.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_q * HD,
+            k_heads, CUDA_R_16BF, HD, (int64_t)T_kv * HD,
+            q_heads, CUDA_R_16BF, HD, (int64_t)T_q * HD,
             &beta,
-            scores.bf16_ptr(), CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
+            scores, CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
             H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
-    softmax_bf16(scores.bf16_ptr(), scores.bf16_ptr(), H * T_q, T_kv, stream);
+    softmax_bf16(scores, scores, H * T_q, T_kv, stream);
 
     // attn_out = scores @ V: [H, T_q, HD]
-    Tensor attn_out({(int64_t)H, (int64_t)T_q, (int64_t)HD}, DType::BF16);
+    auto* attn_out = scratch_.attn_out.bf16_ptr();
     {
         float alpha = 1.0f, beta = 0.0f;
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(
             cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
             HD, T_q, T_kv, &alpha,
-            v_heads.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_kv * HD,
-            scores.bf16_ptr(), CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
+            v_heads, CUDA_R_16BF, HD, (int64_t)T_kv * HD,
+            scores, CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
             &beta,
-            attn_out.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_q * HD,
+            attn_out, CUDA_R_16BF, HD, (int64_t)T_q * HD,
             H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
-    // Transpose back: [H, T_q, HD] -> [T_q, H*HD] via GPU kernel
-    head_untranspose_bf16(attn_out.bf16_ptr(), out, H, T_q, HD, stream);
-
-    // Output projection
-    Tensor o_buf({(int64_t)T_q, (int64_t)D}, DType::BF16);
-    attn.o_proj.forward(cublas_, out, o_buf.bf16_ptr(), T_q, stream);
-    CUDA_CHECK(cudaMemcpyAsync(out, o_buf.bf16_ptr(), T_q * D * sizeof(__nv_bfloat16),
-                                cudaMemcpyDeviceToDevice, stream));
+    // Transpose back [H, T_q, HD] -> [T_q, H*HD] and output projection
+    auto* attn_flat = scratch_.attn_flat.bf16_ptr();
+    head_untranspose_bf16(attn_out, attn_flat, H, T_q, HD, stream);
+    attn.o_proj.forward(cublas_, attn_flat, out, T_q, stream);
 }
 
 // ========================= Forward =========================
@@ -195,25 +234,34 @@ Tensor LLMAdapter::forward(const __nv_bfloat16* source_hidden, int T_src,
     constexpr int HD = ADAPTER_HEAD_DIM;
     cudaStream_t stream = 0;
 
+    // Ensure scratch buffers (no-op if dimensions unchanged)
+    ensure_scratch(T_src, T_tgt);
+
     // 1. Embed target (T5) tokens
     Tensor target({(int64_t)T_tgt, (int64_t)D}, DType::BF16);
     embedding_lookup_bf16(embed_weight_.bf16_ptr(), target_ids,
                           target.bf16_ptr(), T_tgt, D);
 
-    // 2. Build RoPE caches for target and source positions
+    // 2. Build RoPE caches (no-op if max_len unchanged)
     int half_hd = HD / 2;
     int max_len = std::max(T_src, T_tgt);
-    std::vector<float> cos_host(max_len * half_hd), sin_host(max_len * half_hd);
-    build_adapter_rope_cache(cos_host.data(), sin_host.data(), max_len, HD, ADAPTER_ROPE_THETA);
+    if (max_len > rope_cache_len_) {
+        std::vector<float> cos_host(max_len * half_hd), sin_host(max_len * half_hd);
+        build_adapter_rope_cache(cos_host.data(), sin_host.data(), max_len, HD, ADAPTER_ROPE_THETA);
 
-    Tensor cos_gpu({(int64_t)max_len, (int64_t)half_hd}, DType::F32);
-    Tensor sin_gpu({(int64_t)max_len, (int64_t)half_hd}, DType::F32);
-    cos_gpu.copy_from_host(cos_host.data(), cos_host.size() * sizeof(float));
-    sin_gpu.copy_from_host(sin_host.data(), sin_host.size() * sizeof(float));
+        rope_cos_cache_ = Tensor({(int64_t)max_len, (int64_t)half_hd}, DType::F32);
+        rope_sin_cache_ = Tensor({(int64_t)max_len, (int64_t)half_hd}, DType::F32);
+        rope_cos_cache_.copy_from_host(cos_host.data(), cos_host.size() * sizeof(float));
+        rope_sin_cache_.copy_from_host(sin_host.data(), sin_host.size() * sizeof(float));
+        rope_cache_len_ = max_len;
+        fprintf(stderr, "[adapter] computed RoPE cache for max_len=%d\n", max_len);
+    }
 
     // 3. Run 6 adapter blocks
-    Tensor norm_buf({(int64_t)std::max(T_src, T_tgt), (int64_t)D}, DType::BF16);
-    Tensor attn_buf({(int64_t)std::max(T_src, T_tgt), (int64_t)D}, DType::BF16);
+    auto* norm_buf = scratch_.norm_buf.bf16_ptr();
+    auto* attn_buf = scratch_.attn_buf.bf16_ptr();
+    auto* mlp_buf = scratch_.mlp_buf.bf16_ptr();
+    auto* mlp_out = scratch_.mlp_out.bf16_ptr();
 
     __nv_bfloat16* hidden = target.bf16_ptr();
 
@@ -222,40 +270,38 @@ Tensor LLMAdapter::forward(const __nv_bfloat16* source_hidden, int T_src,
 
         // Self-attention: hidden = hidden + self_attn(norm(hidden))
         rms_norm_bf16(hidden, B.norm_self_attn_weight.bf16_ptr(),
-                      norm_buf.bf16_ptr(), T_tgt, D, 1e-6f, stream);
+                      norm_buf, T_tgt, D, 1e-6f, stream);
         run_attention(B.self_attn,
-                      norm_buf.bf16_ptr(), T_tgt,
-                      norm_buf.bf16_ptr(), T_tgt,
-                      attn_buf.bf16_ptr(),
-                      cos_gpu.f32_ptr(), sin_gpu.f32_ptr(),
-                      cos_gpu.f32_ptr(), sin_gpu.f32_ptr(),
+                      norm_buf, T_tgt,
+                      norm_buf, T_tgt,
+                      attn_buf,
+                      rope_cos_cache_.f32_ptr(), rope_sin_cache_.f32_ptr(),
+                      rope_cos_cache_.f32_ptr(), rope_sin_cache_.f32_ptr(),
                       stream);
-        add_bf16(hidden, attn_buf.bf16_ptr(), hidden, (int64_t)T_tgt * D, stream);
+        add_bf16(hidden, attn_buf, hidden, (int64_t)T_tgt * D, stream);
 
         // Cross-attention: hidden = hidden + cross_attn(norm(hidden), source)
         rms_norm_bf16(hidden, B.norm_cross_attn_weight.bf16_ptr(),
-                      norm_buf.bf16_ptr(), T_tgt, D, 1e-6f, stream);
+                      norm_buf, T_tgt, D, 1e-6f, stream);
         run_attention(B.cross_attn,
-                      norm_buf.bf16_ptr(), T_tgt,
+                      norm_buf, T_tgt,
                       source_hidden, T_src,
-                      attn_buf.bf16_ptr(),
-                      cos_gpu.f32_ptr(), sin_gpu.f32_ptr(),
-                      cos_gpu.f32_ptr(), sin_gpu.f32_ptr(),
+                      attn_buf,
+                      rope_cos_cache_.f32_ptr(), rope_sin_cache_.f32_ptr(),
+                      rope_cos_cache_.f32_ptr(), rope_sin_cache_.f32_ptr(),
                       stream);
-        add_bf16(hidden, attn_buf.bf16_ptr(), hidden, (int64_t)T_tgt * D, stream);
+        add_bf16(hidden, attn_buf, hidden, (int64_t)T_tgt * D, stream);
 
         // MLP: hidden = hidden + mlp(norm(hidden))
         rms_norm_bf16(hidden, B.norm_mlp_weight.bf16_ptr(),
-                      norm_buf.bf16_ptr(), T_tgt, D, 1e-6f, stream);
+                      norm_buf, T_tgt, D, 1e-6f, stream);
 
         constexpr int MLP_DIM = 4096;
-        Tensor mlp_buf({(int64_t)T_tgt, (int64_t)MLP_DIM}, DType::BF16);
-        B.mlp_fc1.forward(cublas_, norm_buf.bf16_ptr(), mlp_buf.bf16_ptr(), T_tgt, stream);
-        gelu_tanh_bf16(mlp_buf.bf16_ptr(), mlp_buf.bf16_ptr(), (int64_t)T_tgt * MLP_DIM, stream);
+        B.mlp_fc1.forward(cublas_, norm_buf, mlp_buf, T_tgt, stream);
+        gelu_tanh_bf16(mlp_buf, mlp_buf, (int64_t)T_tgt * MLP_DIM, stream);
 
-        Tensor mlp_out({(int64_t)T_tgt, (int64_t)D}, DType::BF16);
-        B.mlp_fc2.forward(cublas_, mlp_buf.bf16_ptr(), mlp_out.bf16_ptr(), T_tgt, stream);
-        add_bf16(hidden, mlp_out.bf16_ptr(), hidden, (int64_t)T_tgt * D, stream);
+        B.mlp_fc2.forward(cublas_, mlp_buf, mlp_out, T_tgt, stream);
+        add_bf16(hidden, mlp_out, hidden, (int64_t)T_tgt * D, stream);
     }
 
     // 4. Output: norm(out_proj(hidden))

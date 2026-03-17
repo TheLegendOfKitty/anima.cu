@@ -160,6 +160,12 @@ void channel_scale_bf16(
     __nv_bfloat16* out, int B, int C, int spatial,
     cudaStream_t stream = 0);
 
+// ---- Channel Scale+Shift: out[b,c,s] = x[b,c,s] * scale[c] + shift[c] ----
+void channel_scale_shift_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    __nv_bfloat16* out, int B, int C, int spatial,
+    cudaStream_t stream = 0);
+
 // ---- Head Transpose: [T, H*HD] -> [H, T, HD] ----
 void head_transpose_bf16(
     const __nv_bfloat16* src, __nv_bfloat16* dst,

@@ -225,20 +225,9 @@ Tensor VAEAttention::forward(const Tensor& x, cublasHandle_t cublas) const {
     // QKV projection: 1x1 conv via vae_conv3d (handles bias correctly)
     Tensor qkv = vae_conv3d(cublas, normed, qkv_w, qkv_b, 0, 0);
 
-    // Split Q, K, V - all BF16
-    Tensor Q({(int64_t)B, (int64_t)C, (int64_t)S}, DType::BF16);
-    Tensor K({(int64_t)B, (int64_t)C, (int64_t)S}, DType::BF16);
-    Tensor V({(int64_t)B, (int64_t)C, (int64_t)S}, DType::BF16);
-
-    {
-        auto* src = qkv.bf16_ptr();
-        size_t chunk = (size_t)C * S;
-        for (int b = 0; b < B; b++) {
-            CUDA_CHECK(cudaMemcpy(Q.bf16_ptr() + b * chunk, src + b * 3 * chunk, chunk * 2, cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(K.bf16_ptr() + b * chunk, src + b * 3 * chunk + chunk, chunk * 2, cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(V.bf16_ptr() + b * chunk, src + b * 3 * chunk + 2 * chunk, chunk * 2, cudaMemcpyDeviceToDevice));
-        }
-    }
+    // Q, K, V are contiguous slices of qkv — use pointer offsets (no copy)
+    auto* qkv_ptr = qkv.bf16_ptr();
+    size_t chunk = (size_t)C * S;
 
     // For each batch: attn = softmax(Q @ K^T / sqrt(S)) @ V
     // Attention scores computed in F32, softmax in F32, then BF16 output
@@ -246,12 +235,15 @@ Tensor VAEAttention::forward(const Tensor& x, cublasHandle_t cublas) const {
     Tensor scores({(int64_t)B, (int64_t)C, (int64_t)C}, DType::F32);
     Tensor attn_out({(int64_t)B, (int64_t)C, (int64_t)S}, DType::BF16);
 
+    // Pre-allocate F32->BF16 conversion buffer (reused across batches)
+    Tensor sc_bf16({(int64_t)C, (int64_t)C}, DType::BF16);
+
     CUBLAS_CHECK(cublasSetStream(cublas, 0));
 
     for (int b = 0; b < B; b++) {
-        auto* q = Q.bf16_ptr() + (int64_t)b * C * S;
-        auto* k = K.bf16_ptr() + (int64_t)b * C * S;
-        auto* v = V.bf16_ptr() + (int64_t)b * C * S;
+        auto* q = qkv_ptr + b * 3 * chunk;
+        auto* k = q + chunk;
+        auto* v = k + chunk;
         auto* sc = scores.f32_ptr() + (int64_t)b * C * C;
         auto* ao = attn_out.bf16_ptr() + (int64_t)b * C * S;
 
@@ -270,7 +262,6 @@ Tensor VAEAttention::forward(const Tensor& x, cublasHandle_t cublas) const {
         softmax_f32(sc, sc, C, C);
 
         // attn_out = scores @ V: convert scores to BF16, then BF16 GEMM
-        Tensor sc_bf16({(int64_t)C, (int64_t)C}, DType::BF16);
         f32_to_bf16(sc, sc_bf16.bf16_ptr(), (int64_t)C * C, 0);
 
         float one = 1.0f, zero = 0.0f;
@@ -396,26 +387,28 @@ void VAEDecoder::load(const SafeTensorsFile& f) {
 
 Tensor VAEDecoder::decode(const Tensor& latents) {
     // Input: [1, 16, H, W] BF16 normalized latents
-    // Denormalize: z = z * std + mean (stay in BF16)
-    Tensor z(latents.shape(), DType::BF16);
-    {
-        int64_t C = latents.dim(1), spatial = latents.dim(2) * latents.dim(3);
-        std::vector<__nv_bfloat16> host(latents.numel());
-        latents.copy_to_host(host.data(), latents.size_bytes());
+    // Denormalize on GPU: z = z * std + mean (channel-wise)
+    int B = (int)latents.dim(0), C = (int)latents.dim(1);
+    int spatial = (int)(latents.dim(2) * latents.dim(3));
 
-        // Denormalize in BF16
-        for (int64_t c = 0; c < C; c++) {
-            float mean = VAE_LATENTS_MEAN[c];
-            float std_val = VAE_LATENTS_STD[c];
-            for (int64_t s = 0; s < spatial; s++) {
-                int64_t idx = c * spatial + s;
-                float v = __bfloat162float(host[idx]);
-                host[idx] = __float2bfloat16(v * std_val + mean);
-            }
+    // Upload per-channel mean/std to GPU (16 elements each, cached statically)
+    static Tensor s_mean, s_std;
+    if (s_mean.empty()) {
+        std::vector<__nv_bfloat16> mean_bf16(16), std_bf16(16);
+        for (int i = 0; i < 16; i++) {
+            mean_bf16[i] = __float2bfloat16(VAE_LATENTS_MEAN[i]);
+            std_bf16[i] = __float2bfloat16(VAE_LATENTS_STD[i]);
         }
-        z.copy_from_host(host.data(), latents.numel() * sizeof(__nv_bfloat16));
+        s_mean = Tensor({16}, DType::BF16);
+        s_std = Tensor({16}, DType::BF16);
+        s_mean.copy_from_host(mean_bf16.data(), 16 * sizeof(__nv_bfloat16));
+        s_std.copy_from_host(std_bf16.data(), 16 * sizeof(__nv_bfloat16));
     }
-    fprintf(stderr, "[vae] denormalized latents (BF16)\n");
+
+    Tensor z(latents.shape(), DType::BF16);
+    channel_scale_shift_bf16(latents.bf16_ptr(), s_std.bf16_ptr(), s_mean.bf16_ptr(),
+                              z.bf16_ptr(), B, C, spatial, 0);
+    fprintf(stderr, "[vae] denormalized latents (GPU, BF16)\n");
 
     // Post-quant conv (1x1) - BF16
     z = vae_conv3d(cublas_, z, pqc_w, pqc_b, 0, 0);

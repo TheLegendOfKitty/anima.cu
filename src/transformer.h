@@ -118,6 +118,12 @@ private:
         Tensor silu_ts;      // [D] BF16
         Tensor adaln_mid;    // [ADALN_DIM] BF16
 
+        // Timestep embedding buffers (reused across denoising steps)
+        Tensor embedded_ts;  // [D] BF16
+        Tensor temb;         // [6144] BF16
+        Tensor ts_sin_buf;   // [D] BF16 — sinusoidal upload in compute_timestep_embedding
+        Tensor ts_mlp_buf;   // [D] BF16 — MLP buffer in compute_timestep_embedding
+
         int S = 0;
         int S_text = 0;
     } scratch_;

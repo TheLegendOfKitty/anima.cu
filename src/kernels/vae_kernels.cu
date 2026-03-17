@@ -167,3 +167,40 @@ void channel_scale_bf16(
             C, spatial);
     }
 }
+
+// ========================= Channel Scale + Shift =========================
+
+// out[b, c, s] = x[b, c, s] * scale[c] + shift[c]
+__global__ void channel_scale_shift_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ shift,
+    __nv_bfloat16* __restrict__ out,
+    int C, int spatial) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * spatial;
+    if (idx >= total) return;
+
+    int c = idx / spatial;
+    float xv = __bfloat162float(x[idx]);
+    float sv = __bfloat162float(scale[c]);
+    float hv = __bfloat162float(shift[c]);
+    out[idx] = __float2bfloat16(xv * sv + hv);
+}
+
+void channel_scale_shift_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    __nv_bfloat16* out, int B, int C, int spatial,
+    cudaStream_t stream) {
+    int total_per_batch = C * spatial;
+    int threads = 256;
+
+    for (int b = 0; b < B; b++) {
+        int blocks = (total_per_batch + threads - 1) / threads;
+        channel_scale_shift_kernel<<<blocks, threads, 0, stream>>>(
+            x + (int64_t)b * total_per_batch,
+            scale, shift,
+            out + (int64_t)b * total_per_batch,
+            C, spatial);
+    }
+}
