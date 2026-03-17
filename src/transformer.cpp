@@ -122,15 +122,10 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     scratch_.sub_out = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
     scratch_.ff_buf = Tensor({(int64_t)S, (int64_t)MLP_DIM}, DType::BF16);
 
-    // Attention buffers (sized for self-attention = larger case)
+    // Attention buffers — strided SDPA reads [B*S, H*HD] directly, no transpose needed
     scratch_.q_buf = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
     scratch_.k_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
     scratch_.v_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
-    scratch_.q_h = Tensor({(int64_t)H, (int64_t)S, (int64_t)HD}, DType::BF16);
-    scratch_.k_h = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
-    scratch_.v_h = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
-    // scores eliminated — flash attention tiles in SRAM
-    scratch_.attn_out = Tensor({(int64_t)H, (int64_t)S, (int64_t)HD}, DType::BF16);
     scratch_.attn_flat = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
 
     // Cached per-forward-call
@@ -160,8 +155,7 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     add(scratch_.mod); add(scratch_.normed); add(scratch_.gate);
     add(scratch_.sub_out); add(scratch_.ff_buf);
     add(scratch_.q_buf); add(scratch_.k_buf); add(scratch_.v_buf);
-    add(scratch_.q_h); add(scratch_.k_h); add(scratch_.v_h);
-    add(scratch_.attn_out); add(scratch_.attn_flat);
+    add(scratch_.attn_flat);
     add(scratch_.silu_ts); add(scratch_.adaln_mid);
     add(scratch_.embedded_ts); add(scratch_.temb);
     add(scratch_.ts_sin_buf); add(scratch_.ts_mlp_buf);
@@ -332,51 +326,47 @@ void CosmosTransformer::run_attention(
 
     constexpr int H = COSMOS_HEADS;
     constexpr int HD = COSMOS_HEAD_DIM;
+    constexpr int D = H * HD;
     int B = batch_size;
 
-    // Use pre-allocated scratch buffers
+    // Use pre-allocated scratch buffers — stay in [B*T, H*HD] layout throughout.
+    // No physical transpose: cuDNN SDPA reads via strided descriptors.
     auto* q_buf = scratch_.q_buf.bf16_ptr();
     auto* k_buf = scratch_.k_buf.bf16_ptr();
     auto* v_buf = scratch_.v_buf.bf16_ptr();
-    auto* q_h = scratch_.q_h.bf16_ptr();
-    auto* k_h = scratch_.k_h.bf16_ptr();
-    auto* v_h = scratch_.v_h.bf16_ptr();
 
-    // QKV projections: [B*T, D] @ [D, D] = [B*T, D] — naturally batch-agnostic
+    // QKV projections: [B*T, D] @ [D, D] = [B*T, H*HD]
     q_proj.forward(cublas_, q_input, q_buf, B * T_q, stream);
     k_proj.forward(cublas_, kv_input, k_buf, B * T_kv, stream);
     v_proj.forward(cublas_, kv_input, v_buf, B * T_kv, stream);
 
-    // Reshape [B*T, H*HD] -> [B, H, T, HD] for cuDNN SDPA
-    head_transpose_batched_bf16(q_buf, q_h, B, H, T_q, HD, stream);
-    head_transpose_batched_bf16(k_buf, k_h, B, H, T_kv, HD, stream);
-    head_transpose_batched_bf16(v_buf, v_h, B, H, T_kv, HD, stream);
+    // Per-head QK norm — [B*T, H*HD] viewed as [B*T*H, HD] rows (HD contiguous per head)
+    rms_norm_bf16(q_buf, q_norm_w.bf16_ptr(), q_buf, B * T_q * H, HD, 1e-6f, stream);
+    rms_norm_bf16(k_buf, k_norm_w.bf16_ptr(), k_buf, B * T_kv * H, HD, 1e-6f, stream);
 
-    // Per-head QK norm — operates on [B*H*T, HD] rows, batch-agnostic
-    rms_norm_bf16(q_h, q_norm_w.bf16_ptr(), q_h, B * H * T_q, HD, 1e-6f, stream);
-    rms_norm_bf16(k_h, k_norm_w.bf16_ptr(), k_h, B * H * T_kv, HD, 1e-6f, stream);
-
-    // Apply 3D RoPE (self-attention only)
-    // RoPE pattern repeats every S tokens, so for B>1 each batch element gets
-    // the same positional encoding. The kernel works on [total_heads, T, HD]
-    // where total_heads = B*H.
+    // Apply 3D RoPE on [B*S, H*HD] layout (self-attention only)
     if (apply_rope && !rope_cos_cache_.empty()) {
-        rope_cosmos_bf16(q_h, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
-                         q_h, B * H, T_q, HD, stream);
-        rope_cosmos_bf16(k_h, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
-                         k_h, B * H, T_kv, HD, stream);
+        rope_cosmos_strided_bf16(q_buf, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
+                                 B, T_q, H, HD, stream);
+        rope_cosmos_strided_bf16(k_buf, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
+                                 B, T_kv, H, HD, stream);
     }
 
-    // Flash attention via cuDNN SDPA — fuses Q@K^T, softmax, scores@V
+    // Flash attention via cuDNN SDPA with strided layout — no transpose needed.
+    // Physical layout [B*T, H*HD] described as logical [B, H, T, HD] with strides:
+    //   stride_B = T * H * HD,  stride_H = HD,  stride_T = H * HD,  stride_D = 1
     float scale = 1.0f / std::sqrt((float)HD);
-    auto* attn_out = scratch_.attn_out.bf16_ptr();
-    sdpa_.forward(q_h, k_h, v_h, attn_out,
-                  B, H, T_q, T_kv, HD, scale, stream);
+    int64_t q_stride[4] = {(int64_t)T_q * D, (int64_t)HD, (int64_t)D, 1};
+    int64_t kv_stride[4] = {(int64_t)T_kv * D, (int64_t)HD, (int64_t)D, 1};
 
-    // Transpose back [B, H, T_q, HD] -> [B*T_q, H*HD]
+    // Output goes to attn_flat [B*T_q, H*HD] — same strided layout, skip untranspose
     auto* attn_flat = scratch_.attn_flat.bf16_ptr();
-    head_untranspose_batched_bf16(attn_out, attn_flat, B, H, T_q, HD, stream);
+    sdpa_.forward(q_buf, k_buf, v_buf, attn_flat,
+                  B, H, T_q, T_kv, HD,
+                  q_stride, kv_stride, q_stride,  // O uses same strides as Q
+                  scale, stream);
 
+    // O projection: [B*T_q, D] -> [B*T_q, D] — reads directly from strided SDPA output
     o_proj.forward(cublas_, attn_flat, output, B * T_q, stream);
 }
 

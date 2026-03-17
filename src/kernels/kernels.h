@@ -33,6 +33,11 @@ void rope_cosmos_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* cos_freq, const __nv_bfloat16* sin_freq,
     __nv_bfloat16* out, int H, int S, int HD, cudaStream_t stream = 0);
 
+// ---- RoPE (Cosmos halved, strided [B*S, H*HD] layout — no transpose needed) ----
+void rope_cosmos_strided_bf16(
+    __nv_bfloat16* x, const __nv_bfloat16* cos_freq, const __nv_bfloat16* sin_freq,
+    int B, int S, int H, int HD, cudaStream_t stream = 0);
+
 // ---- RoPE (interleaved, legacy) ----
 void rope_interleaved_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* cos_freq, const __nv_bfloat16* sin_freq,

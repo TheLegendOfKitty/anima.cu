@@ -111,11 +111,8 @@ private:
         Tensor q_buf;        // [S, D] BF16
         Tensor k_buf;        // [max_kv, D] BF16
         Tensor v_buf;        // [max_kv, D] BF16
-        Tensor q_h;          // [H, S, HD] BF16
-        Tensor k_h;          // [H, max_kv, HD] BF16
-        Tensor v_h;          // [H, max_kv, HD] BF16
-        Tensor attn_out;     // [H, S, HD] BF16
-        Tensor attn_flat;    // [S, D] BF16
+        // q_h/k_h/v_h/attn_out eliminated — strided SDPA reads [B*S, H*HD] directly
+        Tensor attn_flat;    // [S, D] BF16 — SDPA output (strided write)
 
         // Cached per-forward-call (SiLU(embedded_ts) computed once, reused 84+ times)
         Tensor silu_ts;      // [D] BF16

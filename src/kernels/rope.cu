@@ -61,6 +61,66 @@ void rope_cosmos_bf16(
         x, cos_freq, sin_freq, out, S, HD, total_pairs);
 }
 
+// ========================= Cosmos RoPE for [B*S, H*HD] layout =========================
+//
+// Same rotation as above, but operates on the untransposed [B*S, H*HD] layout
+// where each token's row contains all heads' HD elements contiguously:
+//   token (b,s) at row (b*S + s): [h0_d0..h0_d{HD-1}, h1_d0..h1_d{HD-1}, ...]
+//
+// cos/sin tables are [S, HD], broadcast across all heads and batches.
+
+__global__ void rope_cosmos_strided_bf16_kernel(
+    __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cos_freq,
+    const __nv_bfloat16* __restrict__ sin_freq,
+    int S, int H, int HD, int64_t total_pairs  // total_pairs = B * S * H * HD/2
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+
+    int half_hd = HD / 2;
+
+    // Decompose: idx -> (row, head, half_element)
+    // row = b*S + s, total pairs per row = H * half_hd
+    int pairs_per_row = H * half_hd;
+    int row = (int)(idx / pairs_per_row);       // b*S + s
+    int rem = (int)(idx % pairs_per_row);
+    int h   = rem / half_hd;
+    int i   = rem % half_hd;
+
+    int s = row % S;  // spatial position for cos/sin lookup
+
+    // Indices into x [B*S, H*HD]
+    int64_t base   = (int64_t)row * H * HD + (int64_t)h * HD;
+    int64_t idx_re = base + i;
+    int64_t idx_im = base + i + half_hd;
+
+    // cos/sin from [S, HD], use first half
+    int64_t cs_idx = (int64_t)s * HD + i;
+
+    float x_re = bf16_to_float(x[idx_re]);
+    float x_im = bf16_to_float(x[idx_im]);
+    float c    = bf16_to_float(cos_freq[cs_idx]);
+    float sv   = bf16_to_float(sin_freq[cs_idx]);
+
+    x[idx_re] = float_to_bf16(x_re * c - x_im * sv);
+    x[idx_im] = float_to_bf16(x_im * c + x_re * sv);
+}
+
+void rope_cosmos_strided_bf16(
+    __nv_bfloat16* x,
+    const __nv_bfloat16* cos_freq,
+    const __nv_bfloat16* sin_freq,
+    int B, int S, int H, int HD,
+    cudaStream_t stream
+) {
+    int64_t total_pairs = (int64_t)B * S * H * (HD / 2);
+    int threads = 256;
+    int blocks = (int)((total_pairs + threads - 1) / threads);
+    rope_cosmos_strided_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        x, cos_freq, sin_freq, S, H, HD, total_pairs);
+}
+
 // ========================= Interleaved RoPE (legacy) =========================
 //
 // For each pair (x[2i], x[2i+1]):
