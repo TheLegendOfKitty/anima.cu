@@ -1,0 +1,10 @@
+build/
+*.safetensors
+*.png
+*.ppm
+*.latents
+*.bin
+Anima/
+diffusers-anima/
+.venv/
+__pycache__/
