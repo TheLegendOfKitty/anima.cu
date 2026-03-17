@@ -64,10 +64,11 @@ public:
     //   latents:       [B, 16, 1, latent_h, latent_w] BF16
     //   timestep:      scalar (sigma * ANIMA_SAMPLING_MULTIPLIER)
     //   encoder_cond:  [B, S_text, 1024] BF16 (text conditioning)
-    // Returns: noise prediction [B, 16, 1, latent_h, latent_w] BF16
-    Tensor forward(const Tensor& latents, float timestep,
-                   const __nv_bfloat16* encoder_cond, int S_text,
-                   int batch_size, int latent_h, int latent_w);
+    //   output_buf:    caller-provided buffer [B, 16, 1, H, W] BF16 to write result into
+    void forward(const Tensor& latents, float timestep,
+                 const __nv_bfloat16* encoder_cond, int S_text,
+                 int batch_size, int latent_h, int latent_w,
+                 __nv_bfloat16* output_buf);
 
 private:
     cublasHandle_t cublas_ = nullptr;
@@ -123,6 +124,12 @@ private:
         Tensor temb;         // [6144] BF16
         Tensor ts_sin_buf;   // [D] BF16 — sinusoidal upload in compute_timestep_embedding
         Tensor ts_mlp_buf;   // [D] BF16 — MLP buffer in compute_timestep_embedding
+
+        // Forward-pass temporaries (reused across calls, eliminates per-call cudaMalloc)
+        Tensor padded;       // [B, 17, 1, H, W] BF16 — also backs proj_out (non-overlapping lifetimes)
+        Tensor patches;      // [B*S, patch_dim] BF16
+        Tensor hidden;       // [B*S, D] BF16
+        Tensor proj_out;     // [B*S, out_patch_dim] BF16 — non-owning view into padded's memory
 
         int S = 0;
         int S_text = 0;

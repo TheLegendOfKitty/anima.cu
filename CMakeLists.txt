@@ -11,6 +11,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 # CUDA toolkit
 find_package(CUDAToolkit REQUIRED)
 
+# cuDNN
+find_library(CUDNN_LIB cudnn HINTS /usr/lib/aarch64-linux-gnu /usr/local/lib)
+find_path(CUDNN_INCLUDE cudnn.h HINTS /usr/include/aarch64-linux-gnu /usr/local/include)
+
 # sentencepiece
 find_library(SENTENCEPIECE_LIB sentencepiece HINTS /usr/local/lib)
 find_path(SENTENCEPIECE_INCLUDE sentencepiece_processor.h HINTS /usr/local/include)
@@ -41,8 +45,8 @@ add_library(anima_kernels STATIC
     src/kernels/causal_conv3d.cu
     src/cuda_utils.cu
 )
-target_include_directories(anima_kernels PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(anima_kernels PUBLIC CUDA::cudart)
+target_include_directories(anima_kernels PUBLIC ${CMAKE_SOURCE_DIR}/src ${CUDNN_INCLUDE})
+target_link_libraries(anima_kernels PUBLIC CUDA::cudart ${CUDNN_LIB})
 
 # Core library
 add_library(anima_core STATIC

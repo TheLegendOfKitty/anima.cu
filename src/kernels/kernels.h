@@ -90,6 +90,9 @@ void softmax_bf16(
 void softmax_f32(
     const float* x, float* out,
     int N, int D, cudaStream_t stream = 0);
+void softmax_f32_to_bf16(
+    const float* x, __nv_bfloat16* out,
+    int N, int D, cudaStream_t stream = 0);
 
 // ---- Patchify / Unpatchify ----
 void patchify_bf16(

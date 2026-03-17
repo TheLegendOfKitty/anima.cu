@@ -258,11 +258,8 @@ Tensor VAEAttention::forward(const Tensor& x, cublasHandle_t cublas) const {
             sc, CUDA_R_32F, C,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
-        // Softmax in F32
-        softmax_f32(sc, sc, C, C);
-
-        // attn_out = scores @ V: convert scores to BF16, then BF16 GEMM
-        f32_to_bf16(sc, sc_bf16.bf16_ptr(), (int64_t)C * C, 0);
+        // Fused softmax F32 -> BF16 (eliminates separate f32_to_bf16 conversion pass)
+        softmax_f32_to_bf16(sc, sc_bf16.bf16_ptr(), C, C);
 
         float one = 1.0f, zero = 0.0f;
         CUBLAS_CHECK(cublasGemmEx(cublas,

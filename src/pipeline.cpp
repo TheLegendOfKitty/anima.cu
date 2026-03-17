@@ -123,11 +123,18 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
     int64_t numel = latents.numel();
     bool use_ancestral = (opts_.sampler == "euler_a_rf");
 
-    // Pre-generate noise for ancestral sampler
+    // Pre-allocate output buffers for forward() — reused across all denoising steps.
+    // Each forward() writes into its own buffer so pos/neg results coexist.
+    Tensor noise_pos({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
+    Tensor noise_neg({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
+
+    // Pre-allocate noise buffers for ancestral sampler
     Tensor rand_noise;
+    Tensor noise_f32;
     curandGenerator_t gen = nullptr;
     if (use_ancestral) {
         rand_noise = Tensor({numel}, DType::BF16);
+        noise_f32 = Tensor({numel}, DType::F32);
         curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
         curandSetPseudoRandomGeneratorSeed(gen, opts_.seed + 1000);
     }
@@ -139,16 +146,17 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
         fprintf(stderr, "[sampler] step %d/%d: sigma=%.4f -> %.4f\n",
                 i + 1, (int)sigmas.size() - 1, sigma, sigma_next);
 
-        Tensor noise_pos = transformer_.forward(latents, sigma,
-                                                 pos_cond.bf16_ptr(), S_text,
-                                                 1, latent_h, latent_w);
-        Tensor noise_neg = transformer_.forward(latents, sigma,
-                                                 neg_cond.bf16_ptr(), S_text,
-                                                 1, latent_h, latent_w);
+        transformer_.forward(latents, sigma,
+                             pos_cond.bf16_ptr(), S_text,
+                             1, latent_h, latent_w,
+                             noise_pos.bf16_ptr());
+        transformer_.forward(latents, sigma,
+                             neg_cond.bf16_ptr(), S_text,
+                             1, latent_h, latent_w,
+                             noise_neg.bf16_ptr());
 
         if (use_ancestral && sigma_next > 0.0f) {
-            // Generate fresh noise for this step
-            Tensor noise_f32({numel}, DType::F32);
+            // Generate fresh noise for this step (reuse pre-allocated noise_f32)
             curandGenerateNormal(gen, noise_f32.f32_ptr(), numel, 0.0f, 1.0f);
             f32_to_bf16(noise_f32.f32_ptr(), rand_noise.bf16_ptr(), numel);
 

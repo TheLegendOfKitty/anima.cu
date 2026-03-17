@@ -93,15 +93,20 @@ void CosmosTransformer::load(const SafeTensorsFile& file) {
 // ========================= ensure_scratch =========================
 
 void CosmosTransformer::ensure_scratch(int S, int S_text) {
-    if (S == scratch_.S && S_text == scratch_.S_text) return;
+    if (S <= scratch_.S && S_text <= scratch_.S_text) return;
 
     constexpr int D = COSMOS_HIDDEN;
     constexpr int H = COSMOS_HEADS;
     constexpr int HD = COSMOS_HEAD_DIM;
     constexpr int MLP_DIM = COSMOS_MLP_DIM;
     constexpr int ADALN_DIM = COSMOS_ADALN_DIM;
+    constexpr int C_IN = COSMOS_IN_CHANNELS;
+    constexpr int C_total = C_IN + 1;  // 17
 
     int max_kv = std::max(S, S_text);
+
+    int patch_dim = C_total * COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W;  // 68
+    int out_patch_dim = COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W * COSMOS_OUT_CHANNELS;  // 64
 
     fprintf(stderr, "[transformer] allocating scratch buffers: S=%d, S_text=%d, max_kv=%d\n",
             S, S_text, max_kv);
@@ -135,12 +140,24 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     scratch_.ts_sin_buf = Tensor({(int64_t)D}, DType::BF16);
     scratch_.ts_mlp_buf = Tensor({(int64_t)D}, DType::BF16);
 
+    // Forward-pass temporaries (eliminates per-call cudaMalloc/cudaFree).
+    // padded [B=1, 17, 1, H, W] = S*68 BF16 elements.
+    // proj_out [B*S, out_patch_dim] = S*64 BF16 elements.
+    // padded >= proj_out and they have non-overlapping lifetimes,
+    // so proj_out is a non-owning view into padded's memory.
+    scratch_.padded = Tensor({(int64_t)S * (int64_t)patch_dim}, DType::BF16);
+    scratch_.patches = Tensor({(int64_t)S, (int64_t)patch_dim}, DType::BF16);
+    scratch_.hidden = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.proj_out = Tensor(scratch_.padded.data_ptr(),
+                               {(int64_t)S, (int64_t)out_patch_dim},
+                               DType::BF16, /*owned=*/false);
+
     scratch_.S = S;
     scratch_.S_text = S_text;
 
     // Log scratch memory usage
     size_t total = 0;
-    auto add = [&](const Tensor& t) { total += t.size_bytes(); };
+    auto add = [&](const Tensor& t) { if (t.data_ptr()) total += t.size_bytes(); };
     add(scratch_.mod); add(scratch_.normed); add(scratch_.gate);
     add(scratch_.sub_out); add(scratch_.ff_buf);
     add(scratch_.q_buf); add(scratch_.k_buf); add(scratch_.v_buf);
@@ -150,6 +167,8 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     add(scratch_.silu_ts); add(scratch_.adaln_mid);
     add(scratch_.embedded_ts); add(scratch_.temb);
     add(scratch_.ts_sin_buf); add(scratch_.ts_mlp_buf);
+    add(scratch_.padded); add(scratch_.patches); add(scratch_.hidden);
+    // proj_out is non-owning (shares padded memory), don't double-count
     fprintf(stderr, "[transformer] scratch memory: %.1f MB\n", total / (1024.0 * 1024.0));
 }
 
@@ -360,11 +379,9 @@ void CosmosTransformer::run_attention(
             H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
-    // Softmax in F32, then convert to BF16 for V multiplication
-    softmax_f32(scores, scores, H * T_q, T_kv, stream);
-
+    // Fused softmax F32 -> BF16 (eliminates separate f32_to_bf16 conversion pass)
     auto* scores_bf16 = scratch_.scores_bf16.bf16_ptr();
-    f32_to_bf16(scores, scores_bf16, (int64_t)H * T_q * T_kv, stream);
+    softmax_f32_to_bf16(scores, scores_bf16, H * T_q, T_kv, stream);
 
     // attn_out = scores @ V
     auto* attn_out = scratch_.attn_out.bf16_ptr();
@@ -468,9 +485,10 @@ void CosmosTransformer::forward_block(
 
 // ========================= Forward =========================
 
-Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
-                                   const __nv_bfloat16* encoder_cond, int S_text,
-                                   int batch_size, int latent_h, int latent_w) {
+void CosmosTransformer::forward(const Tensor& latents, float timestep,
+                                const __nv_bfloat16* encoder_cond, int S_text,
+                                int batch_size, int latent_h, int latent_w,
+                                __nv_bfloat16* output_buf) {
     constexpr int D = COSMOS_HIDDEN;
     constexpr int C_IN = COSMOS_IN_CHANNELS;  // 16
     cudaStream_t stream = 0;
@@ -485,30 +503,32 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
     fprintf(stderr, "[transformer] forward: latent=[%d,%d], patches=[%d,%d], S=%d, timestep=%.4f\n",
             latent_h, latent_w, pe_h, pe_w, S, timestep);
 
-    // Ensure scratch buffers are allocated (no-op if already correct size)
+    // Ensure scratch buffers are allocated (no-op if already sufficient size)
     ensure_scratch(S, S_text);
 
     // Cache 3D RoPE (no-op if resolution unchanged)
     compute_3d_rope(1, latent_h, latent_w);
 
+    // Use pre-allocated scratch buffers instead of per-call allocations
+    auto* padded_ptr = scratch_.padded.bf16_ptr();
+    auto* patches_ptr = scratch_.patches.bf16_ptr();
+    auto* hidden_ptr = scratch_.hidden.bf16_ptr();
+
     // 1. Concatenate padding mask (all zeros) as 17th channel
     int C_total = C_IN + 1;  // 17
-    Tensor padded({(int64_t)batch_size, (int64_t)C_total, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
-    CUDA_CHECK(cudaMemset(padded.data_ptr(), 0, padded.size_bytes()));
-    CUDA_CHECK(cudaMemcpy(padded.bf16_ptr(), latents.data_ptr(),
+    size_t padded_bytes = (size_t)batch_size * C_total * 1 * latent_h * latent_w * sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMemset(padded_ptr, 0, padded_bytes));
+    CUDA_CHECK(cudaMemcpy(padded_ptr, latents.data_ptr(),
                            batch_size * C_IN * latent_h * latent_w * sizeof(__nv_bfloat16),
                            cudaMemcpyDeviceToDevice));
 
     // 2. Patchify: [B, 17, 1, H, W] -> [B, S, 68] on GPU
-    int patch_dim = C_total * COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W;  // 68
-    Tensor patches({(int64_t)(batch_size * S), (int64_t)patch_dim}, DType::BF16);
-    patchify_3d_bf16(padded.bf16_ptr(), patches.bf16_ptr(),
+    patchify_3d_bf16(padded_ptr, patches_ptr,
                      batch_size, C_total, 1, latent_h, latent_w,
                      COSMOS_PATCH_T, COSMOS_PATCH_H, COSMOS_PATCH_W, stream);
 
     // 3. Linear projection: [B, S, 68] -> [B, S, 2048]
-    Tensor hidden({(int64_t)(batch_size * S), (int64_t)D}, DType::BF16);
-    patch_proj_.forward(cublas_, patches.bf16_ptr(), hidden.bf16_ptr(), batch_size * S, stream);
+    patch_proj_.forward(cublas_, patches_ptr, hidden_ptr, batch_size * S, stream);
 
     // 4. Compute timestep embedding (uses scratch buffers internally)
     auto* embedded_ts = scratch_.embedded_ts.bf16_ptr();
@@ -522,7 +542,7 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
 
     // 6. Run 28 transformer blocks
     for (int i = 0; i < COSMOS_LAYERS; i++) {
-        forward_block(i, hidden.bf16_ptr(), S,
+        forward_block(i, hidden_ptr, S,
                       encoder_cond, S_text,
                       temb, stream);
 
@@ -547,21 +567,19 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
         const __nv_bfloat16* shift = mod_4096;
         const __nv_bfloat16* scale = mod_4096 + D;
 
-        layer_norm_bf16(hidden.bf16_ptr(), hidden.bf16_ptr(), S, D, 1e-6f, stream);
-        scale_shift_bcast_bf16(hidden.bf16_ptr(), scale, shift, hidden.bf16_ptr(), S, D, stream);
+        layer_norm_bf16(hidden_ptr, hidden_ptr, S, D, 1e-6f, stream);
+        scale_shift_bcast_bf16(hidden_ptr, scale, shift, hidden_ptr, S, D, stream);
     }
 
-    // 8. Output projection: [B*S, 2048] -> [B*S, patch_dim]
-    int out_patch_dim = COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W * COSMOS_OUT_CHANNELS;
-    Tensor proj_out({(int64_t)(batch_size * S), (int64_t)out_patch_dim}, DType::BF16);
-    output_proj_.forward(cublas_, hidden.bf16_ptr(), proj_out.bf16_ptr(), batch_size * S, stream);
+    // 8. Output projection: [B*S, 2048] -> [B*S, out_patch_dim]
+    // proj_out shares memory with padded (non-overlapping lifetimes: padded is done after step 2)
+    auto* proj_out_ptr = scratch_.proj_out.bf16_ptr();
+    output_proj_.forward(cublas_, hidden_ptr, proj_out_ptr, batch_size * S, stream);
 
-    // 9. Unpatchify: [B, S, patch_dim] -> [B, C, T, H, W]
-    Tensor output({(int64_t)batch_size, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
-    unpatchify_3d_bf16(proj_out.bf16_ptr(), output.bf16_ptr(),
+    // 9. Unpatchify: [B, S, patch_dim] -> [B, C, T, H, W] into caller-provided buffer
+    unpatchify_3d_bf16(proj_out_ptr, output_buf,
                        batch_size, COSMOS_OUT_CHANNELS, 1, latent_h, latent_w,
                        COSMOS_PATCH_T, COSMOS_PATCH_H, COSMOS_PATCH_W, stream);
 
     fprintf(stderr, "[transformer] forward complete\n");
-    return output;
 }
