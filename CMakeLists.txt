@@ -1,0 +1,72 @@
+cmake_minimum_required(VERSION 3.25)
+project(anima_cu LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_ARCHITECTURES 110)
+
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -O3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
+# CUDA toolkit
+find_package(CUDAToolkit REQUIRED)
+
+# sentencepiece
+find_library(SENTENCEPIECE_LIB sentencepiece HINTS /usr/local/lib)
+find_path(SENTENCEPIECE_INCLUDE sentencepiece_processor.h HINTS /usr/local/include)
+
+# Third-party headers
+add_library(third_party INTERFACE)
+target_include_directories(third_party INTERFACE
+    ${CMAKE_SOURCE_DIR}/third_party/nlohmann
+    ${CMAKE_SOURCE_DIR}/third_party/stb
+)
+
+# Kernel library
+add_library(anima_kernels STATIC
+    src/kernels/rms_norm.cu
+    src/kernels/layer_norm.cu
+    src/kernels/gelu.cu
+    src/kernels/silu.cu
+    src/kernels/rope.cu
+    src/kernels/adaln.cu
+    src/kernels/elementwise.cu
+    src/kernels/softmax.cu
+    src/kernels/patchify.cu
+    src/kernels/group_norm.cu
+    src/kernels/gemma_ops.cu
+    src/kernels/vae_kernels.cu
+    src/kernels/transpose.cu
+    src/kernels/f32_ops.cu
+    src/kernels/causal_conv3d.cu
+    src/cuda_utils.cu
+)
+target_include_directories(anima_kernels PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(anima_kernels PUBLIC CUDA::cudart)
+
+# Core library
+add_library(anima_core STATIC
+    src/tensor.cpp
+    src/safetensors.cpp
+    src/linear.cpp
+    src/qwen3.cpp
+    src/llm_adapter.cpp
+    src/transformer.cpp
+    src/scheduler.cpp
+    src/pipeline.cpp
+    src/vae.cpp
+    src/qwen3_tokenizer.cpp
+    src/t5_tokenizer.cpp
+)
+target_include_directories(anima_core PUBLIC ${CMAKE_SOURCE_DIR}/src ${SENTENCEPIECE_INCLUDE})
+target_link_libraries(anima_core PUBLIC
+    anima_kernels
+    third_party
+    CUDA::cublas
+    CUDA::curand
+    ${SENTENCEPIECE_LIB}
+)
+
+# Main executable
+add_executable(anima src/main.cpp)
+target_link_libraries(anima PRIVATE anima_core)
