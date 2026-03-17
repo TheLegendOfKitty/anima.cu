@@ -123,11 +123,12 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
     int64_t numel = latents.numel();
     bool use_ancestral = (opts_.sampler == "euler_a_rf");
 
-    // Pre-allocate output buffers for forward() — reused across all denoising steps.
-    Tensor noise_pos({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
-    Tensor noise_neg({1, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
-    auto* noise_pos_ptr = noise_pos.bf16_ptr();
-    auto* noise_neg_ptr = noise_neg.bf16_ptr();
+    // Pre-allocate batched output buffer for forward_batched_cfg() — [2, C, 1, H, W].
+    // Batch 0 = positive conditioning, batch 1 = negative conditioning.
+    int64_t single_numel = (int64_t)COSMOS_OUT_CHANNELS * 1 * latent_h * latent_w;
+    Tensor noise_batched({2, (int64_t)COSMOS_OUT_CHANNELS, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
+    auto* noise_pos_ptr = noise_batched.bf16_ptr();
+    auto* noise_neg_ptr = noise_batched.bf16_ptr() + single_numel;
 
     // Pre-allocate noise buffers for ancestral sampler
     Tensor rand_noise;
@@ -147,12 +148,9 @@ Tensor AnimaPipeline::sample_euler(Tensor latents, const Tensor& pos_cond, const
         fprintf(stderr, "[sampler] step %d/%d: sigma=%.4f -> %.4f\n",
                 i + 1, (int)sigmas.size() - 1, sigma, sigma_next);
 
-        transformer_.forward(latents, sigma,
-                             pos_cond.bf16_ptr(), S_text,
-                             1, latent_h, latent_w, noise_pos_ptr);
-        transformer_.forward(latents, sigma,
-                             neg_cond.bf16_ptr(), S_text,
-                             1, latent_h, latent_w, noise_neg_ptr);
+        transformer_.forward_batched_cfg(latents, sigma,
+                             pos_cond.bf16_ptr(), neg_cond.bf16_ptr(),
+                             S_text, latent_h, latent_w, noise_batched.bf16_ptr());
 
         if (use_ancestral && sigma_next > 0.0f) {
             // Generate fresh noise for this step (reuse pre-allocated noise_f32)

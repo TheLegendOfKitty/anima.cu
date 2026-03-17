@@ -65,12 +65,22 @@ public:
     // Forward pass: single denoising step.
     //   latents:       [B, 16, 1, latent_h, latent_w] BF16
     //   timestep:      scalar (sigma * ANIMA_SAMPLING_MULTIPLIER)
-    //   encoder_cond:  [B, S_text, 1024] BF16 (text conditioning)
+    //   encoder_cond:  [B*S_text, 1024] BF16 (text conditioning, contiguous across batch)
     //   output_buf:    caller-provided buffer [B, 16, 1, H, W] BF16 to write result into
     void forward(const Tensor& latents, float timestep,
                  const __nv_bfloat16* encoder_cond, int S_text,
                  int batch_size, int latent_h, int latent_w,
                  __nv_bfloat16* output_buf);
+
+    // Batched CFG forward: runs positive + negative conditioning in a single batch_size=2 call.
+    //   latents:     [1, 16, 1, H, W] BF16 (shared across both batch elements)
+    //   pos_cond:    [S_text, 1024] BF16
+    //   neg_cond:    [S_text, 1024] BF16
+    //   output_buf:  [2, 16, 1, H, W] BF16 (pos=batch 0, neg=batch 1)
+    void forward_batched_cfg(const Tensor& latents, float timestep,
+                             const __nv_bfloat16* pos_cond, const __nv_bfloat16* neg_cond,
+                             int S_text, int latent_h, int latent_w,
+                             __nv_bfloat16* output_buf);
 
 private:
     cublasHandle_t cublas_ = nullptr;
@@ -130,12 +140,16 @@ private:
         Tensor hidden;       // [B*S, D] BF16
         Tensor proj_out;     // [B*S, out_patch_dim] BF16 — non-owning view into padded's memory
 
+        // Batched CFG: stacked pos+neg conditioning [B*S_text, COSMOS_TEXT_DIM]
+        Tensor stacked_cond;
+
         int S = 0;
         int S_text = 0;
+        int B = 0;
     } scratch_;
 
     // Allocate/resize scratch buffers for given spatial and text token counts.
-    void ensure_scratch(int S, int S_text);
+    void ensure_scratch(int S, int S_text, int batch_size);
 
     void compute_timestep_embedding(float timestep, __nv_bfloat16* embedded_ts,
                                      __nv_bfloat16* temb, cudaStream_t stream);

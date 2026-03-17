@@ -96,9 +96,10 @@ void CosmosTransformer::load(const SafeTensorsFile& file) {
 
 // ========================= ensure_scratch =========================
 
-void CosmosTransformer::ensure_scratch(int S, int S_text) {
-    if (S <= scratch_.S && S_text <= scratch_.S_text) return;
+void CosmosTransformer::ensure_scratch(int S, int S_text, int batch_size) {
+    if (S <= scratch_.S && S_text <= scratch_.S_text && batch_size <= scratch_.B) return;
 
+    int B = std::max(batch_size, scratch_.B);
     constexpr int D = COSMOS_HIDDEN;
     constexpr int H = COSMOS_HEADS;
     constexpr int HD = COSMOS_HEAD_DIM;
@@ -112,42 +113,46 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     int patch_dim = C_total * COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W;  // 68
     int out_patch_dim = COSMOS_PATCH_T * COSMOS_PATCH_H * COSMOS_PATCH_W * COSMOS_OUT_CHANNELS;  // 64
 
-    fprintf(stderr, "[transformer] allocating scratch buffers: S=%d, S_text=%d, max_kv=%d\n",
-            S, S_text, max_kv);
+    fprintf(stderr, "[transformer] allocating scratch buffers: S=%d, S_text=%d, max_kv=%d, B=%d\n",
+            S, S_text, max_kv, B);
 
-    // adaLN reusable buffers
+    // adaLN reusable buffers (mod/gate are per-timestep, shared across batch)
     scratch_.mod = Tensor({3 * (int64_t)D}, DType::BF16);
-    scratch_.normed = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.normed = Tensor({(int64_t)B * S, (int64_t)D}, DType::BF16);
     scratch_.gate = Tensor({(int64_t)D}, DType::BF16);
-    scratch_.sub_out = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
-    scratch_.ff_buf = Tensor({(int64_t)S, (int64_t)MLP_DIM}, DType::BF16);
+    scratch_.sub_out = Tensor({(int64_t)B * S, (int64_t)D}, DType::BF16);
+    scratch_.ff_buf = Tensor({(int64_t)B * S, (int64_t)MLP_DIM}, DType::BF16);
 
     // Attention buffers — strided SDPA reads [B*S, H*HD] directly, no transpose needed
-    scratch_.q_buf = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
-    scratch_.k_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
-    scratch_.v_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
-    scratch_.attn_flat = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.q_buf = Tensor({(int64_t)B * S, (int64_t)D}, DType::BF16);
+    scratch_.k_buf = Tensor({(int64_t)B * max_kv, (int64_t)D}, DType::BF16);
+    scratch_.v_buf = Tensor({(int64_t)B * max_kv, (int64_t)D}, DType::BF16);
+    scratch_.attn_flat = Tensor({(int64_t)B * S, (int64_t)D}, DType::BF16);
 
-    // Cached per-forward-call
+    // Cached per-forward-call (shared across batch — same timestep)
     scratch_.silu_ts = Tensor({(int64_t)D}, DType::BF16);
     scratch_.adaln_mid = Tensor({(int64_t)ADALN_DIM}, DType::BF16);
 
-    // Timestep embedding buffers (reused across denoising steps)
+    // Timestep embedding buffers (reused across denoising steps, shared across batch)
     scratch_.embedded_ts = Tensor({(int64_t)D}, DType::BF16);
     scratch_.temb = Tensor({6144}, DType::BF16);
     scratch_.ts_sin_buf = Tensor({(int64_t)D}, DType::BF16);
     scratch_.ts_mlp_buf = Tensor({(int64_t)D}, DType::BF16);
 
-    // Forward-pass temporaries
-    scratch_.padded = Tensor({(int64_t)S * (int64_t)patch_dim}, DType::BF16);
-    scratch_.patches = Tensor({(int64_t)S, (int64_t)patch_dim}, DType::BF16);
-    scratch_.hidden = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    // Forward-pass temporaries (sized for B batch elements)
+    scratch_.padded = Tensor({(int64_t)B * S * (int64_t)patch_dim}, DType::BF16);
+    scratch_.patches = Tensor({(int64_t)B * S, (int64_t)patch_dim}, DType::BF16);
+    scratch_.hidden = Tensor({(int64_t)B * S, (int64_t)D}, DType::BF16);
     scratch_.proj_out = Tensor(scratch_.padded.data_ptr(),
-                               {(int64_t)S, (int64_t)out_patch_dim},
+                               {(int64_t)B * S, (int64_t)out_patch_dim},
                                DType::BF16, /*owned=*/false);
+
+    // Stacked conditioning for batched CFG
+    scratch_.stacked_cond = Tensor({(int64_t)B * S_text, (int64_t)COSMOS_TEXT_DIM}, DType::BF16);
 
     scratch_.S = S;
     scratch_.S_text = S_text;
+    scratch_.B = B;
 
     // Log scratch memory usage
     size_t total = 0;
@@ -160,6 +165,7 @@ void CosmosTransformer::ensure_scratch(int S, int S_text) {
     add(scratch_.embedded_ts); add(scratch_.temb);
     add(scratch_.ts_sin_buf); add(scratch_.ts_mlp_buf);
     add(scratch_.padded); add(scratch_.patches); add(scratch_.hidden);
+    add(scratch_.stacked_cond);
     // proj_out is non-owning (shares padded memory), don't double-count
     fprintf(stderr, "[transformer] scratch memory: %.1f MB\n", total / (1024.0 * 1024.0));
 }
@@ -479,7 +485,7 @@ void CosmosTransformer::forward(const Tensor& latents, float timestep,
             latent_h, latent_w, pe_h, pe_w, S, timestep);
 
     // Ensure scratch buffers are allocated (no-op if already sufficient size)
-    ensure_scratch(S, S_text);
+    ensure_scratch(S, S_text, batch_size);
 
     // Cache 3D RoPE (no-op if resolution unchanged)
     compute_3d_rope(1, latent_h, latent_w);
@@ -562,4 +568,29 @@ void CosmosTransformer::forward(const Tensor& latents, float timestep,
                        COSMOS_PATCH_T, COSMOS_PATCH_H, COSMOS_PATCH_W, stream);
 
     fprintf(stderr, "[transformer] forward complete\n");
+}
+
+// ========================= Batched CFG Forward =========================
+
+void CosmosTransformer::forward_batched_cfg(
+    const Tensor& latents, float timestep,
+    const __nv_bfloat16* pos_cond, const __nv_bfloat16* neg_cond,
+    int S_text, int latent_h, int latent_w,
+    __nv_bfloat16* output_buf)
+{
+    constexpr int batch_size = 2;
+    int pe_h = latent_h / COSMOS_PATCH_H;
+    int pe_w = latent_w / COSMOS_PATCH_W;
+    int S = pe_h * pe_w;
+
+    ensure_scratch(S, S_text, batch_size);
+
+    // Stack pos+neg conditioning into contiguous [2*S_text, 1024] buffer
+    auto* stacked = scratch_.stacked_cond.bf16_ptr();
+    size_t cond_bytes = (size_t)S_text * COSMOS_TEXT_DIM * sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMemcpyAsync(stacked, pos_cond, cond_bytes, cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(stacked + (size_t)S_text * COSMOS_TEXT_DIM,
+                                neg_cond, cond_bytes, cudaMemcpyDeviceToDevice, 0));
+
+    forward(latents, timestep, stacked, S_text, batch_size, latent_h, latent_w, output_buf);
 }
