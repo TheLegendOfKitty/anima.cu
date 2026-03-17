@@ -2,6 +2,7 @@
 
 #include "tensor.h"
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 // Dense linear layer: y = x @ W^T + bias
 // Weights: BF16 [out_features, in_features]
@@ -21,6 +22,14 @@ public:
                  const __nv_bfloat16* x, __nv_bfloat16* out,
                  int M,  // rows of x (batch * seq_len)
                  cudaStream_t stream = 0) const;
+
+    // Forward with fused GELU epilogue via cublasLt:
+    // out = GELU(x @ W^T + bias)
+    // Eliminates the separate GELU kernel and extra memory round-trip.
+    void forward_gelu(cublasHandle_t handle,
+                      const __nv_bfloat16* x, __nv_bfloat16* out,
+                      int M,
+                      cudaStream_t stream = 0) const;
 
     int in_features()  const { return in_; }
     int out_features() const { return out_; }

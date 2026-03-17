@@ -74,6 +74,7 @@ target_link_libraries(anima_core PUBLIC
     anima_kernels
     third_party
     CUDA::cublas
+    CUDA::cublasLt
     CUDA::curand
     ${CUDNN_LIB}
     ${SENTENCEPIECE_LIB}

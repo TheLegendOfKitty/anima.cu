@@ -4,8 +4,8 @@
 // Optionally scales by weight.
 // Input/output: BF16 [N, D], weight: BF16 [D] or nullptr
 // Internal accumulation in FP32.
+// Vectorized with BF16x2 loads/stores for 2x memory throughput.
 
-// One block per row. Supports D up to ~8192 with 256 threads.
 __global__ void rms_norm_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ weight,  // nullable
@@ -14,44 +14,53 @@ __global__ void rms_norm_bf16_kernel(
     float eps
 ) {
     int row = blockIdx.x;
-    const __nv_bfloat16* xr = x + (int64_t)row * D;
-    __nv_bfloat16* yr = out + (int64_t)row * D;
+    int D2 = D / 2;
+    const __nv_bfloat162* xr2 = reinterpret_cast<const __nv_bfloat162*>(x + (int64_t)row * D);
+    __nv_bfloat162* yr2 = reinterpret_cast<__nv_bfloat162*>(out + (int64_t)row * D);
 
-    // Compute sum of squares
+    // Pass 1: Compute sum of squares (vectorized BF16x2 loads)
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = bf16_to_float(xr[i]);
-        sum_sq += v * v;
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        __nv_bfloat162 val = xr2[i];
+        float v0 = __low2float(val), v1 = __high2float(val);
+        sum_sq = __fmaf_rn(v0, v0, sum_sq);
+        sum_sq = __fmaf_rn(v1, v1, sum_sq);
     }
 
     // Block-wide reduction
     sum_sq = warp_reduce_sum(sum_sq);
-
     __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int warp = threadIdx.x / 32;
-
     if (lane == 0) shared[warp] = sum_sq;
     __syncthreads();
-
     if (warp == 0) {
         sum_sq = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
         sum_sq = warp_reduce_sum(sum_sq);
     }
     __syncthreads();
-
-    // Broadcast
     if (threadIdx.x == 0) shared[0] = sum_sq;
     __syncthreads();
-    sum_sq = shared[0];
 
-    float rms_inv = rsqrtf(sum_sq / D + eps);
+    float rms_inv = rsqrtf(shared[0] / D + eps);
 
-    // Normalize and optionally scale
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = bf16_to_float(xr[i]) * rms_inv;
-        if (weight) v *= bf16_to_float(weight[i]);
-        yr[i] = float_to_bf16(v);
+    // Pass 2: Normalize and optionally scale (vectorized)
+    if (weight) {
+        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+        for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+            __nv_bfloat162 val = xr2[i];
+            __nv_bfloat162 wv = w2[i];
+            float v0 = __low2float(val) * rms_inv * __low2float(wv);
+            float v1 = __high2float(val) * rms_inv * __high2float(wv);
+            yr2[i] = __floats2bfloat162_rn(v0, v1);
+        }
+    } else {
+        for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+            __nv_bfloat162 val = xr2[i];
+            float v0 = __low2float(val) * rms_inv;
+            float v1 = __high2float(val) * rms_inv;
+            yr2[i] = __floats2bfloat162_rn(v0, v1);
+        }
     }
 }
 
@@ -63,7 +72,8 @@ void rms_norm_bf16(
     float eps,
     cudaStream_t stream
 ) {
-    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
+    int D2 = D / 2;
+    int threads = (D2 <= 1024) ? ((D2 + 31) / 32 * 32) : 1024;
     if (threads < 32) threads = 32;
     rms_norm_bf16_kernel<<<N, threads, 0, stream>>>(x, weight, out, D, eps);
 }

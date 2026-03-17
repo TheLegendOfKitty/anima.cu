@@ -451,8 +451,7 @@ void CosmosTransformer::forward_block(
     }
 
     auto* ff_buf = scratch_.ff_buf.bf16_ptr();
-    B.ff_proj1.forward(cublas_, normed, ff_buf, BS, stream);
-    gelu_tanh_bf16(ff_buf, ff_buf, (int64_t)BS * MLP_DIM, stream);
+    B.ff_proj1.forward_gelu(cublas_, normed, ff_buf, BS, stream);
     B.ff_proj2.forward(cublas_, ff_buf, sub_out, BS, stream);
 
     // Final residual of this block (no subsequent adaLN to fuse with)

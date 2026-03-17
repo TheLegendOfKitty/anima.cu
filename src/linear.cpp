@@ -1,6 +1,7 @@
 #include "linear.h"
 #include "cuda_utils.cuh"
 #include "kernels/kernels.h"
+#include <cublasLt.h>
 
 void Linear::load(Tensor weight, Tensor bias) {
     assert(weight.ndim() == 2);
@@ -71,4 +72,80 @@ void Linear::forward(cublasHandle_t handle,
     if (!bias_.empty()) {
         bias_add_bf16(out, bias_.bf16_ptr(), out, M, out_, stream);
     }
+}
+
+// Lazy singleton for cublasLt handle
+static cublasLtHandle_t get_cublaslt_handle() {
+    static cublasLtHandle_t handle = nullptr;
+    if (!handle) {
+        cublasLtCreate(&handle);
+    }
+    return handle;
+}
+
+void Linear::forward_gelu(cublasHandle_t handle,
+                           const __nv_bfloat16* x, __nv_bfloat16* out,
+                           int M, cudaStream_t stream) const {
+    cublasLtHandle_t ltHandle = get_cublaslt_handle();
+
+    // Create matmul descriptor
+    cublasLtMatmulDesc_t matmulDesc;
+    cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+
+    // Set transpose operations (same layout as cublasGemmEx in forward())
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                   &transA, sizeof(transA));
+    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                   &transB, sizeof(transB));
+
+    // Set GELU epilogue with optional bias
+    cublasLtEpilogue_t epilogue;
+    if (!bias_.empty()) {
+        epilogue = CUBLASLT_EPILOGUE_GELU_BIAS;
+        const void* biasPtr = bias_.data_ptr();
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                       &biasPtr, sizeof(biasPtr));
+        cudaDataType_t biasDt = CUDA_R_16BF;
+        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                       &biasDt, sizeof(biasDt));
+    } else {
+        epilogue = CUBLASLT_EPILOGUE_GELU;
+    }
+    cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                   &epilogue, sizeof(epilogue));
+
+    // Create matrix layouts
+    // A (W): stored row-major [out_, in_] = col-major [in_, out_], transposed to [out_, in_]
+    // B (x): stored row-major [M, in_] = col-major [in_, M]
+    // C/D (out): stored row-major [M, out_] = col-major [out_, M]
+    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+    cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16BF, in_, out_, in_);
+    cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16BF, in_, M, in_);
+    cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, out_, M, out_);
+
+    float alpha = 1.0f, beta = 0.0f;
+
+    cublasStatus_t status = cublasLtMatmul(
+        ltHandle, matmulDesc,
+        &alpha,
+        weight_.data_ptr(), Adesc,   // A = W
+        x, Bdesc,                     // B = x
+        &beta,
+        out, Cdesc,                   // C (for beta*C)
+        out, Cdesc,                   // D = output
+        nullptr, nullptr, 0,          // no algo preference, no workspace
+        stream);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasLtMatmul (GELU) failed: %d\n", (int)status);
+        exit(1);
+    }
+
+    // Cleanup descriptors
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Cdesc);
+    cublasLtMatmulDescDestroy(matmulDesc);
 }

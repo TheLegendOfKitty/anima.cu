@@ -1,78 +1,5 @@
 #include "cuda_utils.cuh"
 
-// LayerNorm with elementwise_affine=False:
-// out = (x - mean(x)) / sqrt(var(x) + eps)
-// Input/output: BF16 [N, D]. Internal FP32.
-
-__global__ void layer_norm_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ out,
-    int D,
-    float eps
-) {
-    int row = blockIdx.x;
-    const __nv_bfloat16* xr = x + (int64_t)row * D;
-    __nv_bfloat16* yr = out + (int64_t)row * D;
-
-    // Compute mean
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        sum += bf16_to_float(xr[i]);
-    }
-
-    sum = warp_reduce_sum(sum);
-    __shared__ float shared[32];
-    int lane = threadIdx.x % 32;
-    int warp = threadIdx.x / 32;
-    if (lane == 0) shared[warp] = sum;
-    __syncthreads();
-    if (warp == 0) {
-        sum = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
-        sum = warp_reduce_sum(sum);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) shared[0] = sum;
-    __syncthreads();
-    float mean = shared[0] / D;
-
-    // Compute variance
-    float var_sum = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = bf16_to_float(xr[i]) - mean;
-        var_sum += v * v;
-    }
-
-    var_sum = warp_reduce_sum(var_sum);
-    if (lane == 0) shared[warp] = var_sum;
-    __syncthreads();
-    if (warp == 0) {
-        var_sum = (lane < (blockDim.x + 31) / 32) ? shared[lane] : 0.0f;
-        var_sum = warp_reduce_sum(var_sum);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) shared[0] = var_sum;
-    __syncthreads();
-    float inv_std = rsqrtf(shared[0] / D + eps);
-
-    // Normalize
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = (bf16_to_float(xr[i]) - mean) * inv_std;
-        yr[i] = float_to_bf16(v);
-    }
-}
-
-void layer_norm_bf16(
-    const __nv_bfloat16* x,
-    __nv_bfloat16* out,
-    int N, int D,
-    float eps,
-    cudaStream_t stream
-) {
-    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
-    if (threads < 32) threads = 32;
-    layer_norm_bf16_kernel<<<N, threads, 0, stream>>>(x, out, D, eps);
-}
-
 // ========================= Shared reduction helper =========================
 
 // Reduce a float value across the entire CTA using warp shuffles + shared memory.
@@ -89,6 +16,59 @@ __device__ __forceinline__ float cta_reduce_sum(float val, float* shared) {
     if (threadIdx.x == 0) shared[0] = val;
     __syncthreads();
     return shared[0];
+}
+
+// LayerNorm with elementwise_affine=False:
+// out = (x - mean(x)) / sqrt(var(x) + eps)
+// Input/output: BF16 [N, D]. Internal FP32.
+
+// Vectorized with BF16x2 and 2-pass (single-pass mean+sum_sq, then normalize).
+__global__ void layer_norm_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ out,
+    int D,
+    float eps
+) {
+    int row = blockIdx.x;
+    int D2 = D / 2;
+    const __nv_bfloat162* xr2 = reinterpret_cast<const __nv_bfloat162*>(x + (int64_t)row * D);
+    __nv_bfloat162* yr2 = reinterpret_cast<__nv_bfloat162*>(out + (int64_t)row * D);
+
+    __shared__ float shared[33];
+
+    // Pass 1: single-pass mean + sum_of_squares (vectorized BF16x2 loads)
+    float sum = 0.0f, sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        __nv_bfloat162 val = xr2[i];
+        float v0 = __low2float(val), v1 = __high2float(val);
+        sum += v0 + v1;
+        sum_sq = __fmaf_rn(v0, v0, sum_sq);
+        sum_sq = __fmaf_rn(v1, v1, sum_sq);
+    }
+    float mean = cta_reduce_sum(sum, shared) / D;
+    float var = cta_reduce_sum(sum_sq, shared) / D - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+
+    // Pass 2: normalize (vectorized BF16x2 loads/stores)
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        __nv_bfloat162 val = xr2[i];
+        float v0 = (__low2float(val) - mean) * inv_std;
+        float v1 = (__high2float(val) - mean) * inv_std;
+        yr2[i] = __floats2bfloat162_rn(v0, v1);
+    }
+}
+
+void layer_norm_bf16(
+    const __nv_bfloat16* x,
+    __nv_bfloat16* out,
+    int N, int D,
+    float eps,
+    cudaStream_t stream
+) {
+    int D2 = D / 2;
+    int threads = (D2 <= 1024) ? ((D2 + 31) / 32 * 32) : 1024;
+    if (threads < 32) threads = 32;
+    layer_norm_bf16_kernel<<<N, threads, 0, stream>>>(x, out, D, eps);
 }
 
 // ========================= Fused adaLN: LayerNorm + scale_shift_bcast =========================

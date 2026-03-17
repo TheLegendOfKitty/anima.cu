@@ -7,6 +7,7 @@
 // out:   BF16 [N, D]
 // Internal FP32 accumulation.
 
+// Vectorized with BF16x2 loads/stores.
 __global__ void adaln_rms_norm_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ scale,
@@ -16,16 +17,19 @@ __global__ void adaln_rms_norm_bf16_kernel(
     float eps
 ) {
     int row = blockIdx.x;
-    const __nv_bfloat16* xr = x + (int64_t)row * D;
-    const __nv_bfloat16* sr = scale + (int64_t)row * D;
-    const __nv_bfloat16* hr = shift + (int64_t)row * D;
-    __nv_bfloat16* yr = out + (int64_t)row * D;
+    int D2 = D / 2;
+    const __nv_bfloat162* xr2 = reinterpret_cast<const __nv_bfloat162*>(x + (int64_t)row * D);
+    const __nv_bfloat162* sr2 = reinterpret_cast<const __nv_bfloat162*>(scale + (int64_t)row * D);
+    const __nv_bfloat162* hr2 = reinterpret_cast<const __nv_bfloat162*>(shift + (int64_t)row * D);
+    __nv_bfloat162* yr2 = reinterpret_cast<__nv_bfloat162*>(out + (int64_t)row * D);
 
-    // RMS norm: compute sum of squares
+    // RMS norm: compute sum of squares (vectorized)
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = bf16_to_float(xr[i]);
-        sum_sq += v * v;
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        __nv_bfloat162 val = xr2[i];
+        float v0 = __low2float(val), v1 = __high2float(val);
+        sum_sq = __fmaf_rn(v0, v0, sum_sq);
+        sum_sq = __fmaf_rn(v1, v1, sum_sq);
     }
 
     sum_sq = warp_reduce_sum(sum_sq);
@@ -43,12 +47,13 @@ __global__ void adaln_rms_norm_bf16_kernel(
     __syncthreads();
     float rms_inv = rsqrtf(shared[0] / D + eps);
 
-    // Apply: norm(x) * (1 + scale) + shift
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = bf16_to_float(xr[i]) * rms_inv;
-        float s = bf16_to_float(sr[i]);
-        float h = bf16_to_float(hr[i]);
-        yr[i] = float_to_bf16(v * (1.0f + s) + h);
+    // Apply: norm(x) * (1 + scale) + shift (vectorized)
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        __nv_bfloat162 xv = xr2[i], sv = sr2[i], hv = hr2[i];
+        float x0 = __low2float(xv) * rms_inv, x1 = __high2float(xv) * rms_inv;
+        float r0 = __fmaf_rn(x0, 1.0f + __low2float(sv), __low2float(hv));
+        float r1 = __fmaf_rn(x1, 1.0f + __high2float(sv), __high2float(hv));
+        yr2[i] = __floats2bfloat162_rn(r0, r1);
     }
 }
 
@@ -61,7 +66,8 @@ void adaln_rms_norm_bf16(
     float eps,
     cudaStream_t stream
 ) {
-    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
+    int D2 = D / 2;
+    int threads = (D2 <= 1024) ? ((D2 + 31) / 32 * 32) : 1024;
     if (threads < 32) threads = 32;
     adaln_rms_norm_bf16_kernel<<<N, threads, 0, stream>>>(x, scale, shift, out, D, eps);
 }
