@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 // ========================= Weight Loading =========================
 
@@ -89,6 +90,61 @@ void CosmosTransformer::load(const SafeTensorsFile& file) {
     fprintf(stderr, "[transformer] loaded: %d blocks\n", COSMOS_LAYERS);
 }
 
+// ========================= ensure_scratch =========================
+
+void CosmosTransformer::ensure_scratch(int S, int S_text) {
+    if (S == scratch_.S && S_text == scratch_.S_text) return;
+
+    constexpr int D = COSMOS_HIDDEN;
+    constexpr int H = COSMOS_HEADS;
+    constexpr int HD = COSMOS_HEAD_DIM;
+    constexpr int MLP_DIM = COSMOS_MLP_DIM;
+    constexpr int ADALN_DIM = COSMOS_ADALN_DIM;
+
+    int max_kv = std::max(S, S_text);
+
+    fprintf(stderr, "[transformer] allocating scratch buffers: S=%d, S_text=%d, max_kv=%d\n",
+            S, S_text, max_kv);
+
+    // adaLN reusable buffers
+    scratch_.mod = Tensor({3 * (int64_t)D}, DType::BF16);
+    scratch_.normed = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.gate = Tensor({(int64_t)D}, DType::BF16);
+    scratch_.sub_out = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.ff_buf = Tensor({(int64_t)S, (int64_t)MLP_DIM}, DType::BF16);
+
+    // Attention buffers (sized for self-attention = larger case)
+    scratch_.q_buf = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+    scratch_.k_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.v_buf = Tensor({(int64_t)max_kv, (int64_t)D}, DType::BF16);
+    scratch_.q_h = Tensor({(int64_t)H, (int64_t)S, (int64_t)HD}, DType::BF16);
+    scratch_.k_h = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
+    scratch_.v_h = Tensor({(int64_t)H, (int64_t)max_kv, (int64_t)HD}, DType::BF16);
+    scratch_.scores = Tensor({(int64_t)H, (int64_t)S, (int64_t)max_kv}, DType::F32);
+    scratch_.scores_bf16 = Tensor({(int64_t)H, (int64_t)S, (int64_t)max_kv}, DType::BF16);
+    scratch_.attn_out = Tensor({(int64_t)H, (int64_t)S, (int64_t)HD}, DType::BF16);
+    scratch_.attn_flat = Tensor({(int64_t)S, (int64_t)D}, DType::BF16);
+
+    // Cached per-forward-call
+    scratch_.silu_ts = Tensor({(int64_t)D}, DType::BF16);
+    scratch_.adaln_mid = Tensor({(int64_t)ADALN_DIM}, DType::BF16);
+
+    scratch_.S = S;
+    scratch_.S_text = S_text;
+
+    // Log scratch memory usage
+    size_t total = 0;
+    auto add = [&](const Tensor& t) { total += t.size_bytes(); };
+    add(scratch_.mod); add(scratch_.normed); add(scratch_.gate);
+    add(scratch_.sub_out); add(scratch_.ff_buf);
+    add(scratch_.q_buf); add(scratch_.k_buf); add(scratch_.v_buf);
+    add(scratch_.q_h); add(scratch_.k_h); add(scratch_.v_h);
+    add(scratch_.scores); add(scratch_.scores_bf16);
+    add(scratch_.attn_out); add(scratch_.attn_flat);
+    add(scratch_.silu_ts); add(scratch_.adaln_mid);
+    fprintf(stderr, "[transformer] scratch memory: %.1f MB\n", total / (1024.0 * 1024.0));
+}
+
 // ========================= Timestep Embedding =========================
 
 void CosmosTransformer::compute_timestep_embedding(
@@ -96,12 +152,8 @@ void CosmosTransformer::compute_timestep_embedding(
     cudaStream_t stream) {
 
     constexpr int D = COSMOS_HIDDEN;  // 2048
-    constexpr int TEMB_DIM = 6144;    // 3 * 2048
 
     // 1. Sinusoidal timestep projection (Timesteps class, flip_sin_to_cos=True)
-    // half_dim = D // 2 = 1024
-    // freqs = exp(-log(10000) * arange(0, half_dim) / half_dim) * timestep
-    // emb = [cos(freqs), sin(freqs)]
     int half_dim = D / 2;
     std::vector<float> sinusoidal(D);
     for (int i = 0; i < half_dim; i++) {
@@ -129,14 +181,21 @@ void CosmosTransformer::compute_timestep_embedding(
     time_linear_1_.forward(cublas_, sin_gpu.bf16_ptr(), mlp_buf.bf16_ptr(), 1, stream);
     silu_bf16(mlp_buf.bf16_ptr(), mlp_buf.bf16_ptr(), D, stream);
     time_linear_2_.forward(cublas_, mlp_buf.bf16_ptr(), temb, 1, stream);
-
 }
 
-// ========================= 3D RoPE =========================
+// ========================= 3D RoPE (cached) =========================
 
-void CosmosTransformer::compute_3d_rope(int num_frames, int height, int width,
-                                          Tensor& cos_out, Tensor& sin_out) {
+void CosmosTransformer::compute_3d_rope(int num_frames, int height, int width) {
     constexpr int HD = COSMOS_HEAD_DIM;  // 128
+
+    int pe_h = height / COSMOS_PATCH_H;
+    int pe_w = width / COSMOS_PATCH_W;
+
+    // Return cached if resolution hasn't changed
+    if (pe_h == rope_cache_h_ && pe_w == rope_cache_w_ && !rope_cos_cache_.empty()) return;
+
+    fprintf(stderr, "[transformer] computing 3D RoPE: pe=[%d, %d, %d]\n",
+            num_frames, pe_h, pe_w);
 
     // Dimension splits
     int dim_h = (HD / 6) * 2;   // 42
@@ -145,8 +204,6 @@ void CosmosTransformer::compute_3d_rope(int num_frames, int height, int width,
 
     // Patch sizes
     int pe_t = num_frames / COSMOS_PATCH_T;  // frames / 1
-    int pe_h = height / COSMOS_PATCH_H;      // height / 2
-    int pe_w = width / COSMOS_PATCH_W;        // width / 2
     int S = pe_t * pe_h * pe_w;  // total spatial tokens
 
     // NTK scaling factors
@@ -174,8 +231,6 @@ void CosmosTransformer::compute_3d_rope(int num_frames, int height, int width,
     auto t_freqs = make_freqs(dim_t, t_theta);
 
     // Build [S, HD] cos and sin arrays
-    // For each spatial position (t, h, w), concatenate [emb_t, emb_h, emb_w] * 2
-    // where emb_x = outer(position, freqs_x) — shape [half_dim_x]
     std::vector<float> cos_host(S * HD), sin_host(S * HD);
 
     for (int ft = 0; ft < pe_t; ft++) {
@@ -222,16 +277,106 @@ void CosmosTransformer::compute_3d_rope(int num_frames, int height, int width,
     }
 
     // Upload to GPU as BF16
-    cos_out = Tensor({(int64_t)S, (int64_t)HD}, DType::BF16);
-    sin_out = Tensor({(int64_t)S, (int64_t)HD}, DType::BF16);
+    rope_cos_cache_ = Tensor({(int64_t)S, (int64_t)HD}, DType::BF16);
+    rope_sin_cache_ = Tensor({(int64_t)S, (int64_t)HD}, DType::BF16);
 
     std::vector<__nv_bfloat16> cos_bf16(S * HD), sin_bf16(S * HD);
     for (int i = 0; i < S * HD; i++) {
         cos_bf16[i] = __float2bfloat16(cos_host[i]);
         sin_bf16[i] = __float2bfloat16(sin_host[i]);
     }
-    cos_out.copy_from_host(cos_bf16.data(), S * HD * sizeof(__nv_bfloat16));
-    sin_out.copy_from_host(sin_bf16.data(), S * HD * sizeof(__nv_bfloat16));
+    rope_cos_cache_.copy_from_host(cos_bf16.data(), S * HD * sizeof(__nv_bfloat16));
+    rope_sin_cache_.copy_from_host(sin_bf16.data(), S * HD * sizeof(__nv_bfloat16));
+
+    rope_cache_h_ = pe_h;
+    rope_cache_w_ = pe_w;
+}
+
+// ========================= Attention (scratch-based) =========================
+
+void CosmosTransformer::run_attention(
+    const Linear& q_proj, const Linear& k_proj,
+    const Linear& v_proj, const Linear& o_proj,
+    const Tensor& q_norm_w, const Tensor& k_norm_w,
+    const __nv_bfloat16* q_input, int T_q,
+    const __nv_bfloat16* kv_input, int T_kv,
+    __nv_bfloat16* output,
+    bool apply_rope,
+    cudaStream_t stream) {
+
+    constexpr int H = COSMOS_HEADS;
+    constexpr int HD = COSMOS_HEAD_DIM;
+
+    // Use pre-allocated scratch buffers
+    auto* q_buf = scratch_.q_buf.bf16_ptr();
+    auto* k_buf = scratch_.k_buf.bf16_ptr();
+    auto* v_buf = scratch_.v_buf.bf16_ptr();
+    auto* q_h = scratch_.q_h.bf16_ptr();
+    auto* k_h = scratch_.k_h.bf16_ptr();
+    auto* v_h = scratch_.v_h.bf16_ptr();
+
+    // QKV projections
+    q_proj.forward(cublas_, q_input, q_buf, T_q, stream);
+    k_proj.forward(cublas_, kv_input, k_buf, T_kv, stream);
+    v_proj.forward(cublas_, kv_input, v_buf, T_kv, stream);
+
+    // Reshape [T, H*HD] -> [H, T, HD]
+    head_transpose_bf16(q_buf, q_h, H, T_q, HD, stream);
+    head_transpose_bf16(k_buf, k_h, H, T_kv, HD, stream);
+    head_transpose_bf16(v_buf, v_h, H, T_kv, HD, stream);
+
+    // Per-head QK norm
+    rms_norm_bf16(q_h, q_norm_w.bf16_ptr(), q_h, H * T_q, HD, 1e-6f, stream);
+    rms_norm_bf16(k_h, k_norm_w.bf16_ptr(), k_h, H * T_kv, HD, 1e-6f, stream);
+
+    // Apply 3D RoPE (self-attention only)
+    if (apply_rope && !rope_cos_cache_.empty()) {
+        rope_cosmos_bf16(q_h, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
+                         q_h, H, T_q, HD, stream);
+        rope_cosmos_bf16(k_h, rope_cos_cache_.bf16_ptr(), rope_sin_cache_.bf16_ptr(),
+                         k_h, H, T_kv, HD, stream);
+    }
+
+    // Attention: scores = Q @ K^T / sqrt(HD) in F32 for precision
+    float scale = 1.0f / std::sqrt((float)HD);
+    auto* scores = scratch_.scores.f32_ptr();
+    {
+        float alpha = scale, beta = 0.0f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+            T_kv, T_q, HD, &alpha,
+            k_h, CUDA_R_16BF, HD, (int64_t)T_kv * HD,
+            q_h, CUDA_R_16BF, HD, (int64_t)T_q * HD,
+            &beta,
+            scores, CUDA_R_32F, T_kv, (int64_t)T_q * T_kv,
+            H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    // Softmax in F32, then convert to BF16 for V multiplication
+    softmax_f32(scores, scores, H * T_q, T_kv, stream);
+
+    auto* scores_bf16 = scratch_.scores_bf16.bf16_ptr();
+    f32_to_bf16(scores, scores_bf16, (int64_t)H * T_q * T_kv, stream);
+
+    // attn_out = scores @ V
+    auto* attn_out = scratch_.attn_out.bf16_ptr();
+    {
+        float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
+            HD, T_q, T_kv, &alpha,
+            v_h, CUDA_R_16BF, HD, (int64_t)T_kv * HD,
+            scores_bf16, CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
+            &beta,
+            attn_out, CUDA_R_16BF, HD, (int64_t)T_q * HD,
+            H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    // Transpose back [H, T_q, HD] -> [T_q, H*HD]
+    auto* attn_flat = scratch_.attn_flat.bf16_ptr();
+    head_untranspose_bf16(attn_out, attn_flat, H, T_q, HD, stream);
+
+    o_proj.forward(cublas_, attn_flat, output, T_q, stream);
 }
 
 // ========================= Transformer Block =========================
@@ -240,200 +385,77 @@ void CosmosTransformer::forward_block(
     int block_idx,
     __nv_bfloat16* hidden, int S,
     const __nv_bfloat16* encoder_cond, int S_text,
-    const __nv_bfloat16* embedded_ts,
     const __nv_bfloat16* temb,
-    const __nv_bfloat16* rope_cos,
-    const __nv_bfloat16* rope_sin,
-    int batch_size,
     cudaStream_t stream) {
 
     auto& B = blocks_[block_idx];
-    constexpr int D = COSMOS_HIDDEN;       // 2048
-    constexpr int H = COSMOS_HEADS;        // 16
-    constexpr int HD = COSMOS_HEAD_DIM;    // 128
-    constexpr int ADALN_DIM = COSMOS_ADALN_DIM; // 256
-    constexpr int TEXT_DIM = COSMOS_TEXT_DIM;    // 1024
-    constexpr int MLP_DIM = COSMOS_MLP_DIM;     // 8192
+    constexpr int D = COSMOS_HIDDEN;
+    constexpr int MLP_DIM = COSMOS_MLP_DIM;
 
     CUBLAS_CHECK(cublasSetStream(cublas_, stream));
 
-    // Helper: compute adaLN-Zero modulation
-    // Returns (shift, scale, gate) each [D] in a single [3*D] buffer
-    auto compute_adaln_zero = [&](const CosmosAdaLNZero& aln, __nv_bfloat16* out_6144) {
-        // SiLU(embedded_ts) -> linear_1 -> linear_2 + temb -> out [6144]
-        Tensor silu_buf({(int64_t)D}, DType::BF16);
-        CUDA_CHECK(cudaMemcpyAsync(silu_buf.bf16_ptr(), embedded_ts,
-                                    D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        silu_bf16(silu_buf.bf16_ptr(), silu_buf.bf16_ptr(), D, stream);
+    // Scratch pointers (pre-allocated, reused across blocks)
+    auto* mod = scratch_.mod.bf16_ptr();
+    auto* normed = scratch_.normed.bf16_ptr();
+    auto* gate = scratch_.gate.bf16_ptr();
+    auto* sub_out = scratch_.sub_out.bf16_ptr();
+    auto* silu_ts = scratch_.silu_ts.bf16_ptr();
+    auto* adaln_mid = scratch_.adaln_mid.bf16_ptr();
 
-        Tensor adaln_mid({(int64_t)ADALN_DIM}, DType::BF16);
-        aln.linear_1.forward(cublas_, silu_buf.bf16_ptr(), adaln_mid.bf16_ptr(), 1, stream);
-        aln.linear_2.forward(cublas_, adaln_mid.bf16_ptr(), out_6144, 1, stream);
-
-        // Add temb (6144-dim)
-        add_bf16(out_6144, temb, out_6144, 3 * D, stream);
+    // Helper: compute adaLN-Zero modulation (uses pre-computed silu_ts)
+    auto compute_adaln_zero = [&](const CosmosAdaLNZero& aln) {
+        aln.linear_1.forward(cublas_, silu_ts, adaln_mid, 1, stream);
+        aln.linear_2.forward(cublas_, adaln_mid, mod, 1, stream);
+        add_bf16(mod, temb, mod, 3 * D, stream);
     };
 
     // Helper: apply adaLN modulation
-    // normed = LayerNorm(hidden) * (1 + scale) + shift
-    auto apply_adaln = [&](const __nv_bfloat16* x, const __nv_bfloat16* mod_6144,
-                            __nv_bfloat16* normed, __nv_bfloat16* gate_out) {
-        // mod_6144 = [shift(D), scale(D), gate(D)]
-        const __nv_bfloat16* shift = mod_6144;
-        const __nv_bfloat16* scale = mod_6144 + D;
-        const __nv_bfloat16* gate = mod_6144 + 2 * D;
+    auto apply_adaln = [&](const __nv_bfloat16* x) {
+        const __nv_bfloat16* shift = mod;
+        const __nv_bfloat16* scale = mod + D;
+        const __nv_bfloat16* g = mod + 2 * D;
 
-        // LayerNorm(x)
         layer_norm_bf16(x, normed, S, D, 1e-6f, stream);
-
-        // normed = normed * (1 + scale) + shift  (broadcast scale/shift over S tokens)
         scale_shift_bcast_bf16(normed, scale, shift, normed, S, D, stream);
 
-        // Copy gate
-        CUDA_CHECK(cudaMemcpyAsync(gate_out, gate, D * sizeof(__nv_bfloat16),
+        CUDA_CHECK(cudaMemcpyAsync(gate, g, D * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToDevice, stream));
-    };
-
-    // Helper: run attention (self or cross)
-    auto run_attention = [&](const Linear& q_proj, const Linear& k_proj,
-                              const Linear& v_proj, const Linear& o_proj,
-                              const Tensor& q_norm_w, const Tensor& k_norm_w,
-                              const __nv_bfloat16* q_input, int T_q,
-                              const __nv_bfloat16* kv_input, int T_kv,
-                              __nv_bfloat16* output,
-                              bool apply_rope) {
-        int QD = H * HD;  // 2048
-
-        Tensor q_buf({(int64_t)T_q, (int64_t)QD}, DType::BF16);
-        Tensor k_buf({(int64_t)T_kv, (int64_t)QD}, DType::BF16);
-        Tensor v_buf({(int64_t)T_kv, (int64_t)QD}, DType::BF16);
-
-        q_proj.forward(cublas_, q_input, q_buf.bf16_ptr(), T_q, stream);
-        k_proj.forward(cublas_, kv_input, k_buf.bf16_ptr(), T_kv, stream);
-        v_proj.forward(cublas_, kv_input, v_buf.bf16_ptr(), T_kv, stream);
-
-        // Reshape [T, H*HD] -> [H, T, HD] via GPU kernel
-        Tensor q_h({(int64_t)H, (int64_t)T_q, (int64_t)HD}, DType::BF16);
-        Tensor k_h({(int64_t)H, (int64_t)T_kv, (int64_t)HD}, DType::BF16);
-        Tensor v_h({(int64_t)H, (int64_t)T_kv, (int64_t)HD}, DType::BF16);
-
-        head_transpose_bf16(q_buf.bf16_ptr(), q_h.bf16_ptr(), H, T_q, HD, stream);
-        head_transpose_bf16(k_buf.bf16_ptr(), k_h.bf16_ptr(), H, T_kv, HD, stream);
-        head_transpose_bf16(v_buf.bf16_ptr(), v_h.bf16_ptr(), H, T_kv, HD, stream);
-
-        // Per-head QK norm
-        rms_norm_bf16(q_h.bf16_ptr(), q_norm_w.bf16_ptr(),
-                      q_h.bf16_ptr(), H * T_q, HD, 1e-6f, stream);
-        rms_norm_bf16(k_h.bf16_ptr(), k_norm_w.bf16_ptr(),
-                      k_h.bf16_ptr(), H * T_kv, HD, 1e-6f, stream);
-
-        // Apply 3D RoPE (self-attention only)
-        if (apply_rope && rope_cos && rope_sin) {
-            // Cosmos 3D RoPE with use_real=True, use_real_unbind_dim=-2
-            // cos/sin are [S, HD] BF16, broadcast across H heads.
-            // Halved pattern: pairs (x[i], x[i+HD/2]) rotated as complex numbers.
-            rope_cosmos_bf16(q_h.bf16_ptr(), rope_cos, rope_sin,
-                             q_h.bf16_ptr(), H, T_q, HD, stream);
-            rope_cosmos_bf16(k_h.bf16_ptr(), rope_cos, rope_sin,
-                             k_h.bf16_ptr(), H, T_kv, HD, stream);
-        }
-
-        // Attention: scores = Q @ K^T / sqrt(HD) in F32 for precision
-        float scale = 1.0f / std::sqrt((float)HD);
-        Tensor scores({(int64_t)H, (int64_t)T_q, (int64_t)T_kv}, DType::F32);
-
-        {
-            float alpha = scale, beta = 0.0f;
-            CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-                cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                T_kv, T_q, HD, &alpha,
-                k_h.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_kv * HD,
-                q_h.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_q * HD,
-                &beta,
-                scores.f32_ptr(), CUDA_R_32F, T_kv, (int64_t)T_q * T_kv,
-                H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
-
-        // Softmax in F32, then convert to BF16 for V multiplication
-        softmax_f32(scores.f32_ptr(), scores.f32_ptr(), H * T_q, T_kv, stream);
-        Tensor scores_bf16({(int64_t)H, (int64_t)T_q, (int64_t)T_kv}, DType::BF16);
-        f32_to_bf16(scores.f32_ptr(), scores_bf16.bf16_ptr(), (int64_t)H * T_q * T_kv, stream);
-
-        // attn_out = scores @ V
-        Tensor attn_out({(int64_t)H, (int64_t)T_q, (int64_t)HD}, DType::BF16);
-        {
-            float alpha = 1.0f, beta = 0.0f;
-            CUBLAS_CHECK(cublasGemmStridedBatchedEx(
-                cublas_, CUBLAS_OP_N, CUBLAS_OP_N,
-                HD, T_q, T_kv, &alpha,
-                v_h.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_kv * HD,
-                scores_bf16.bf16_ptr(), CUDA_R_16BF, T_kv, (int64_t)T_q * T_kv,
-                &beta,
-                attn_out.bf16_ptr(), CUDA_R_16BF, HD, (int64_t)T_q * HD,
-                H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
-
-        // Transpose back [H, T_q, HD] -> [T_q, H*HD] via GPU kernel
-        Tensor attn_flat({(int64_t)T_q, (int64_t)QD}, DType::BF16);
-        head_untranspose_bf16(attn_out.bf16_ptr(), attn_flat.bf16_ptr(), H, T_q, HD, stream);
-
-        o_proj.forward(cublas_, attn_flat.bf16_ptr(), output, T_q, stream);
     };
 
     // --- Block execution ---
 
     // 1. Self-attention with adaLN-Zero
-    Tensor mod1({3 * (int64_t)D}, DType::BF16);
-    compute_adaln_zero(B.norm1, mod1.bf16_ptr());
+    compute_adaln_zero(B.norm1);
+    apply_adaln(hidden);
 
-    Tensor normed1({(int64_t)S, (int64_t)D}, DType::BF16);
-    Tensor gate1({(int64_t)D}, DType::BF16);
-    apply_adaln(hidden, mod1.bf16_ptr(), normed1.bf16_ptr(), gate1.bf16_ptr());
-
-    Tensor sa_out({(int64_t)S, (int64_t)D}, DType::BF16);
     run_attention(B.sa_q_proj, B.sa_k_proj, B.sa_v_proj, B.sa_o_proj,
                   B.sa_q_norm, B.sa_k_norm,
-                  normed1.bf16_ptr(), S, normed1.bf16_ptr(), S,
-                  sa_out.bf16_ptr(), true);
+                  normed, S, normed, S,
+                  sub_out, true, stream);
 
-    // Residual: hidden = hidden + gate * sa_out
-    residual_gate_bcast_bf16(hidden, sa_out.bf16_ptr(), gate1.bf16_ptr(),
-                              hidden, S, D, stream);
+    residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, S, D, stream);
 
     // 2. Cross-attention with adaLN-Zero
-    Tensor mod2({3 * (int64_t)D}, DType::BF16);
-    compute_adaln_zero(B.norm2, mod2.bf16_ptr());
+    compute_adaln_zero(B.norm2);
+    apply_adaln(hidden);
 
-    Tensor normed2({(int64_t)S, (int64_t)D}, DType::BF16);
-    Tensor gate2({(int64_t)D}, DType::BF16);
-    apply_adaln(hidden, mod2.bf16_ptr(), normed2.bf16_ptr(), gate2.bf16_ptr());
-
-    Tensor ca_out({(int64_t)S, (int64_t)D}, DType::BF16);
     run_attention(B.ca_q_proj, B.ca_k_proj, B.ca_v_proj, B.ca_o_proj,
                   B.ca_q_norm, B.ca_k_norm,
-                  normed2.bf16_ptr(), S, encoder_cond, S_text,
-                  ca_out.bf16_ptr(), false);
+                  normed, S, encoder_cond, S_text,
+                  sub_out, false, stream);
 
-    residual_gate_bcast_bf16(hidden, ca_out.bf16_ptr(), gate2.bf16_ptr(),
-                              hidden, S, D, stream);
+    residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, S, D, stream);
 
     // 3. Feed-forward with adaLN-Zero
-    Tensor mod3({3 * (int64_t)D}, DType::BF16);
-    compute_adaln_zero(B.norm3, mod3.bf16_ptr());
+    compute_adaln_zero(B.norm3);
+    apply_adaln(hidden);
 
-    Tensor normed3({(int64_t)S, (int64_t)D}, DType::BF16);
-    Tensor gate3({(int64_t)D}, DType::BF16);
-    apply_adaln(hidden, mod3.bf16_ptr(), normed3.bf16_ptr(), gate3.bf16_ptr());
+    auto* ff_buf = scratch_.ff_buf.bf16_ptr();
+    B.ff_proj1.forward(cublas_, normed, ff_buf, S, stream);
+    gelu_tanh_bf16(ff_buf, ff_buf, (int64_t)S * MLP_DIM, stream);
+    B.ff_proj2.forward(cublas_, ff_buf, sub_out, S, stream);
 
-    Tensor ff_buf({(int64_t)S, (int64_t)MLP_DIM}, DType::BF16);
-    B.ff_proj1.forward(cublas_, normed3.bf16_ptr(), ff_buf.bf16_ptr(), S, stream);
-    gelu_tanh_bf16(ff_buf.bf16_ptr(), ff_buf.bf16_ptr(), (int64_t)S * MLP_DIM, stream);
-
-    Tensor ff_out({(int64_t)S, (int64_t)D}, DType::BF16);
-    B.ff_proj2.forward(cublas_, ff_buf.bf16_ptr(), ff_out.bf16_ptr(), S, stream);
-
-    residual_gate_bcast_bf16(hidden, ff_out.bf16_ptr(), gate3.bf16_ptr(),
-                              hidden, S, D, stream);
+    residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, S, D, stream);
 }
 
 // ========================= Forward =========================
@@ -455,13 +477,16 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
     fprintf(stderr, "[transformer] forward: latent=[%d,%d], patches=[%d,%d], S=%d, timestep=%.4f\n",
             latent_h, latent_w, pe_h, pe_w, S, timestep);
 
+    // Ensure scratch buffers are allocated (no-op if already correct size)
+    ensure_scratch(S, S_text);
+
+    // Cache 3D RoPE (no-op if resolution unchanged)
+    compute_3d_rope(1, latent_h, latent_w);
+
     // 1. Concatenate padding mask (all zeros) as 17th channel
-    // Input: [B, 16, 1, H, W] -> [B, 17, 1, H, W]
-    // For now, create combined tensor with padding mask = 0
     int C_total = C_IN + 1;  // 17
     Tensor padded({(int64_t)batch_size, (int64_t)C_total, 1, (int64_t)latent_h, (int64_t)latent_w}, DType::BF16);
     CUDA_CHECK(cudaMemset(padded.data_ptr(), 0, padded.size_bytes()));
-    // Copy latent channels
     CUDA_CHECK(cudaMemcpy(padded.bf16_ptr(), latents.data_ptr(),
                            batch_size * C_IN * latent_h * latent_w * sizeof(__nv_bfloat16),
                            cudaMemcpyDeviceToDevice));
@@ -482,32 +507,26 @@ Tensor CosmosTransformer::forward(const Tensor& latents, float timestep,
     Tensor temb({6144}, DType::BF16);
     compute_timestep_embedding(timestep, embedded_ts.bf16_ptr(), temb.bf16_ptr(), stream);
 
-    // 5. Compute 3D RoPE
-    Tensor rope_cos, rope_sin;
-    compute_3d_rope(1, latent_h, latent_w, rope_cos, rope_sin);
+    // 5. Pre-compute SiLU(embedded_ts) once (reused 84+ times across 28 blocks)
+    CUDA_CHECK(cudaMemcpyAsync(scratch_.silu_ts.bf16_ptr(), embedded_ts.bf16_ptr(),
+                                D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+    silu_bf16(scratch_.silu_ts.bf16_ptr(), scratch_.silu_ts.bf16_ptr(), D, stream);
 
     // 6. Run 28 transformer blocks
     for (int i = 0; i < COSMOS_LAYERS; i++) {
         forward_block(i, hidden.bf16_ptr(), S,
                       encoder_cond, S_text,
-                      embedded_ts.bf16_ptr(), temb.bf16_ptr(),
-                      rope_cos.bf16_ptr(), rope_sin.bf16_ptr(),
-                      batch_size, stream);
+                      temb.bf16_ptr(), stream);
 
         if ((i + 1) % 10 == 0) {
             fprintf(stderr, "[transformer]   block %d/%d done\n", i + 1, COSMOS_LAYERS);
         }
     }
 
-    // 7. Output norm (CosmosAdaLayerNorm — shift + scale only, no gate)
+    // 7. Output norm (also uses pre-computed silu_ts)
     {
-        Tensor silu_buf({(int64_t)D}, DType::BF16);
-        CUDA_CHECK(cudaMemcpy(silu_buf.bf16_ptr(), embedded_ts.bf16_ptr(),
-                               D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
-        silu_bf16(silu_buf.bf16_ptr(), silu_buf.bf16_ptr(), D, stream);
-
         Tensor adaln_mid({(int64_t)COSMOS_ADALN_DIM}, DType::BF16);
-        output_norm_.linear_1.forward(cublas_, silu_buf.bf16_ptr(), adaln_mid.bf16_ptr(), 1, stream);
+        output_norm_.linear_1.forward(cublas_, scratch_.silu_ts.bf16_ptr(), adaln_mid.bf16_ptr(), 1, stream);
 
         Tensor mod_4096({4096}, DType::BF16);
         output_norm_.linear_2.forward(cublas_, adaln_mid.bf16_ptr(), mod_4096.bf16_ptr(), 1, stream);

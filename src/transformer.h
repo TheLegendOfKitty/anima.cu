@@ -87,18 +87,64 @@ private:
     CosmosAdaLN output_norm_;
     Linear output_proj_;  // [64, 2048]
 
-    // Helpers
+    // ---- RoPE cache (reused across denoising steps for same resolution) ----
+    Tensor rope_cos_cache_, rope_sin_cache_;
+    int rope_cache_h_ = 0, rope_cache_w_ = 0;
+
+    // ---- Pre-allocated scratch buffers (reused across all 28 blocks and steps) ----
+    struct Scratch {
+        // adaLN outputs (reused across 3 sub-layers per block)
+        Tensor mod;          // [6144] BF16
+        Tensor normed;       // [S, D] BF16
+        Tensor gate;         // [D] BF16
+        Tensor sub_out;      // [S, D] BF16 — for sa_out, ca_out, ff_out
+
+        // FFN
+        Tensor ff_buf;       // [S, MLP_DIM] BF16
+
+        // Attention internals (sized for self-attn = max, reused for cross-attn)
+        Tensor q_buf;        // [S, D] BF16
+        Tensor k_buf;        // [max_kv, D] BF16
+        Tensor v_buf;        // [max_kv, D] BF16
+        Tensor q_h;          // [H, S, HD] BF16
+        Tensor k_h;          // [H, max_kv, HD] BF16
+        Tensor v_h;          // [H, max_kv, HD] BF16
+        Tensor scores;       // [H, S, max_kv] F32
+        Tensor scores_bf16;  // [H, S, max_kv] BF16
+        Tensor attn_out;     // [H, S, HD] BF16
+        Tensor attn_flat;    // [S, D] BF16
+
+        // Cached per-forward-call (SiLU(embedded_ts) computed once, reused 84+ times)
+        Tensor silu_ts;      // [D] BF16
+        Tensor adaln_mid;    // [ADALN_DIM] BF16
+
+        int S = 0;
+        int S_text = 0;
+    } scratch_;
+
+    // Allocate/resize scratch buffers for given spatial and text token counts.
+    void ensure_scratch(int S, int S_text);
+
     void compute_timestep_embedding(float timestep, __nv_bfloat16* embedded_ts,
                                      __nv_bfloat16* temb, cudaStream_t stream);
-    void compute_3d_rope(int num_frames, int height, int width,
-                          Tensor& cos_out, Tensor& sin_out);
+
+    // Compute and cache 3D RoPE (no-op if resolution unchanged).
+    void compute_3d_rope(int num_frames, int height, int width);
+
+    // Run a single transformer block using scratch buffers.
     void forward_block(int block_idx,
                         __nv_bfloat16* hidden, int S,
                         const __nv_bfloat16* encoder_cond, int S_text,
-                        const __nv_bfloat16* embedded_ts,
                         const __nv_bfloat16* temb,
-                        const __nv_bfloat16* rope_cos,
-                        const __nv_bfloat16* rope_sin,
-                        int batch_size,
                         cudaStream_t stream);
+
+    // Attention sub-layer using pre-allocated scratch buffers.
+    void run_attention(const Linear& q_proj, const Linear& k_proj,
+                       const Linear& v_proj, const Linear& o_proj,
+                       const Tensor& q_norm_w, const Tensor& k_norm_w,
+                       const __nv_bfloat16* q_input, int T_q,
+                       const __nv_bfloat16* kv_input, int T_kv,
+                       __nv_bfloat16* output,
+                       bool apply_rope,
+                       cudaStream_t stream);
 };

@@ -69,15 +69,21 @@ void causal_conv3d_forward(
     int W_out = (W + 2 * padW - kW) + 1;
     int T_out = (T_padded - kT) + 1;
 
-    // Allocate im2col workspace
+    // Reuse workspace across calls (high-water-mark allocation avoids per-call malloc/free)
+    static __nv_bfloat16* s_workspace = nullptr;
+    static int64_t s_workspace_elems = 0;
+
     int64_t col_size = (int64_t)C_in * kT * kH * kW * T_out * H_out * W_out;
-    __nv_bfloat16* workspace;
-    CUDA_CHECK(cudaMalloc(&workspace, col_size * sizeof(__nv_bfloat16)));
+    if (col_size > s_workspace_elems) {
+        if (s_workspace) { CUDA_CHECK(cudaFree(s_workspace)); }
+        CUDA_CHECK(cudaMalloc(&s_workspace, col_size * sizeof(__nv_bfloat16)));
+        s_workspace_elems = col_size;
+    }
 
     // im2col
     int block = 256;
     int grid = (int)((col_size + block - 1) / block);
-    im2col_3d_kernel<<<grid, block, 0, stream>>>(input, workspace,
+    im2col_3d_kernel<<<grid, block, 0, stream>>>(input, s_workspace,
         C_in, T, H, W, kT, kH, kW, padH, padW, causal_pad,
         1, 1, 1, T_out, H_out, W_out);
 
@@ -92,7 +98,7 @@ void causal_conv3d_forward(
         cublas, CUBLAS_OP_N, CUBLAS_OP_N,
         N, M, K,
         &alpha,
-        workspace, CUDA_R_16BF, N,
+        s_workspace, CUDA_R_16BF, N,
         weight, CUDA_R_16BF, K,
         &beta,
         output, CUDA_R_16BF, N,
@@ -106,6 +112,4 @@ void causal_conv3d_forward(
         int gd = (total + bk - 1) / bk;
         conv_bias_add_kernel<<<gd, bk, 0, stream>>>(bias, output, C_out, spatial);
     }
-
-    CUDA_CHECK(cudaFree(workspace));
 }
