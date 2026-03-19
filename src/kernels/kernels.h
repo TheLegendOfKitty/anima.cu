@@ -69,6 +69,9 @@ void residual_gate_bf16(
 void add_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* b,
     __nv_bfloat16* out, int64_t N, cudaStream_t stream = 0);
+void add3_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, const __nv_bfloat16* c,
+    __nv_bfloat16* out, int64_t N, cudaStream_t stream = 0);
 void scale_bf16(
     const __nv_bfloat16* x, __nv_bfloat16* out,
     float scale, int64_t N, cudaStream_t stream = 0);

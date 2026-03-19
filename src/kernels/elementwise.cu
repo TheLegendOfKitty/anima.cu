@@ -62,6 +62,37 @@ void add_bf16(
     add_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, out, N2);
 }
 
+// ---- Three-way add: out = a + b + c ----
+__global__ void add3_bf16_kernel(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ c,
+    __nv_bfloat16* __restrict__ out,
+    int64_t N2
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N2) return;
+    const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(a);
+    const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(b);
+    const __nv_bfloat162* c2 = reinterpret_cast<const __nv_bfloat162*>(c);
+    __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(out);
+
+    __nv_bfloat162 av = a2[idx], bv = b2[idx], cv = c2[idx];
+    float r0 = __low2float(av) + __low2float(bv) + __low2float(cv);
+    float r1 = __high2float(av) + __high2float(bv) + __high2float(cv);
+    out2[idx] = __floats2bfloat162_rn(r0, r1);
+}
+
+void add3_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, const __nv_bfloat16* c,
+    __nv_bfloat16* out, int64_t N, cudaStream_t stream
+) {
+    int64_t N2 = N / 2;
+    int threads = 256;
+    int blocks = ceil_div((int)N2, threads);
+    add3_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, c, out, N2);
+}
+
 // ---- Scale: out = x * scale (scalar) ----
 __global__ void scale_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
