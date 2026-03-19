@@ -9,6 +9,7 @@
 #include "vae.h"
 #include "qwen3_tokenizer.h"
 #include "t5_tokenizer.h"
+#include "spectrum.h"
 #include <string>
 
 struct AnimaOptions {
@@ -25,7 +26,11 @@ struct AnimaOptions {
     float beta_beta = FORGE_BETA_BETA;
     float eta = 1.0f;
     float s_noise = 1.0f;
+    int er_sde_stages = 3;  // ER-SDE max stages (1-3)
     std::string output_path = "output.png";
+
+    // Spectrum acceleration
+    SpectrumConfig spectrum;
 
     // Tokenizer paths
     std::string qwen3_tokenizer_path;

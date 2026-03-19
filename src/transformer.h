@@ -82,10 +82,22 @@ public:
                              int S_text, int latent_h, int latent_w,
                              __nv_bfloat16* output_buf);
 
+    // Spectrum: run only output norm + projection on predicted hidden state.
+    //   hidden_fp32: [B*S, 2048] FP32 (from Spectrum prediction)
+    //   output_buf:  [B, 16, 1, H, W] BF16 result
+    void forward_output_only(const float* hidden_fp32, float timestep,
+                             int batch_size, int S, int latent_h, int latent_w,
+                             __nv_bfloat16* output_buf);
+
+    // Set pointer for hidden state capture. When non-null, forward() copies
+    // scratch_.hidden [B*S, 2048] BF16 -> capture_ptr FP32 after all 28 blocks.
+    void set_hidden_capture(float* ptr) { hidden_capture_ptr_ = ptr; }
+
 private:
     cublasHandle_t cublas_ = nullptr;
     cudnnHandle_t cudnn_ = nullptr;
     CudnnSDPA sdpa_;
+    float* hidden_capture_ptr_ = nullptr;  // Spectrum: if non-null, capture hidden state
 
     // Patch embedding
     Linear patch_proj_;  // [2048, 68] (17 channels * 1*2*2 patch)

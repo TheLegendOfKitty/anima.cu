@@ -462,6 +462,7 @@ void CosmosTransformer::forward_block(
 
     // Final residual of this block (no subsequent adaLN to fuse with)
     residual_gate_bcast_bf16(hidden, sub_out, gate, hidden, BS, D, stream);
+
 }
 
 // ========================= Forward =========================
@@ -537,6 +538,12 @@ void CosmosTransformer::forward(const Tensor& latents, float timestep,
         }
     }
 
+    // Spectrum: capture hidden state [B*S, D] BF16 -> FP32 if requested
+    if (hidden_capture_ptr_) {
+        bf16_to_f32(hidden_ptr, hidden_capture_ptr_,
+                    (int64_t)batch_size * S * D, stream);
+    }
+
     // 7. Output norm (reuses scratch buffers — adaln_mid and mod are free after block loop)
     {
         auto* adaln_mid = scratch_.adaln_mid.bf16_ptr();
@@ -593,4 +600,60 @@ void CosmosTransformer::forward_batched_cfg(
                                 neg_cond, cond_bytes, cudaMemcpyDeviceToDevice, 0));
 
     forward(latents, timestep, stacked, S_text, batch_size, latent_h, latent_w, output_buf);
+}
+
+// ========================= Spectrum Output-Only Forward =========================
+
+void CosmosTransformer::forward_output_only(
+    const float* hidden_fp32, float timestep,
+    int batch_size, int S, int latent_h, int latent_w,
+    __nv_bfloat16* output_buf)
+{
+    constexpr int D = COSMOS_HIDDEN;
+    cudaStream_t stream = 0;
+    CUBLAS_CHECK(cublasSetStream(cublas_, stream));
+    int BS = batch_size * S;
+
+    // Scratch buffers should already be allocated from prior actual forward calls
+    ensure_scratch(S, 1, batch_size);
+
+    // 1. Convert FP32 hidden to BF16
+    auto* hidden_ptr = scratch_.hidden.bf16_ptr();
+    f32_to_bf16(hidden_fp32, hidden_ptr, (int64_t)BS * D, stream);
+
+    // 2. Compute timestep embedding
+    auto* embedded_ts = scratch_.embedded_ts.bf16_ptr();
+    auto* temb = scratch_.temb.bf16_ptr();
+    compute_timestep_embedding(timestep, embedded_ts, temb, stream);
+
+    // 3. Pre-compute SiLU(embedded_ts)
+    CUDA_CHECK(cudaMemcpyAsync(scratch_.silu_ts.bf16_ptr(), embedded_ts,
+                                D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+    silu_bf16(scratch_.silu_ts.bf16_ptr(), scratch_.silu_ts.bf16_ptr(), D, stream);
+
+    // 4. Output norm (AdaLN: shift + scale, no gate)
+    {
+        auto* adaln_mid = scratch_.adaln_mid.bf16_ptr();
+        output_norm_.linear_1.forward(cublas_, scratch_.silu_ts.bf16_ptr(), adaln_mid, 1, stream);
+
+        auto* mod_4096 = scratch_.mod.bf16_ptr();
+        output_norm_.linear_2.forward(cublas_, adaln_mid, mod_4096, 1, stream);
+
+        add_bf16(mod_4096, temb, mod_4096, 4096, stream);
+
+        const __nv_bfloat16* shift = mod_4096;
+        const __nv_bfloat16* scale = mod_4096 + D;
+
+        layer_norm_bf16(hidden_ptr, hidden_ptr, BS, D, 1e-6f, stream);
+        scale_shift_bcast_bf16(hidden_ptr, scale, shift, hidden_ptr, BS, D, stream);
+    }
+
+    // 5. Output projection: [BS, 2048] -> [BS, 64]
+    auto* proj_out_ptr = scratch_.proj_out.bf16_ptr();
+    output_proj_.forward(cublas_, hidden_ptr, proj_out_ptr, BS, stream);
+
+    // 6. Unpatchify: [B, S, 64] -> [B, C, T, H, W]
+    unpatchify_3d_bf16(proj_out_ptr, output_buf,
+                       batch_size, COSMOS_OUT_CHANNELS, 1, latent_h, latent_w,
+                       COSMOS_PATCH_T, COSMOS_PATCH_H, COSMOS_PATCH_W, stream);
 }

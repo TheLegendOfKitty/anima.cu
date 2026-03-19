@@ -3,9 +3,9 @@ project(anima_cu LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_ARCHITECTURES 110)
+set(CMAKE_CUDA_ARCHITECTURES 120)
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -O3")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
 # CUDA toolkit
@@ -15,9 +15,9 @@ find_package(CUDAToolkit REQUIRED)
 find_library(CUDNN_LIB cudnn HINTS /usr/lib/aarch64-linux-gnu /usr/local/lib)
 find_path(CUDNN_INCLUDE cudnn.h HINTS /usr/include/aarch64-linux-gnu /usr/local/include)
 
-# sentencepiece
-find_library(SENTENCEPIECE_LIB sentencepiece HINTS /usr/local/lib)
-find_path(SENTENCEPIECE_INCLUDE sentencepiece_processor.h HINTS /usr/local/include)
+# sentencepiece (static build)
+set(SENTENCEPIECE_LIB /tmp/sentencepiece/build/src/libsentencepiece.a)
+set(SENTENCEPIECE_INCLUDE /tmp/sentencepiece/src)
 
 # Third-party headers
 add_library(third_party INTERFACE)
@@ -44,9 +44,10 @@ add_library(anima_kernels STATIC
     src/kernels/f32_ops.cu
     src/kernels/causal_conv3d.cu
     src/cuda_utils.cu
+    src/spectrum.cu
 )
 target_include_directories(anima_kernels PUBLIC ${CMAKE_SOURCE_DIR}/src ${CUDNN_INCLUDE})
-target_link_libraries(anima_kernels PUBLIC CUDA::cudart ${CUDNN_LIB})
+target_link_libraries(anima_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cusolver ${CUDNN_LIB})
 
 # Core library
 add_library(anima_core STATIC
@@ -66,6 +67,7 @@ add_library(anima_core STATIC
 target_include_directories(anima_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/cudnn-frontend/include
     /home/parsa/sglang/.venv/lib/python3.13/site-packages/include
     ${SENTENCEPIECE_INCLUDE}
     ${CUDNN_INCLUDE}
@@ -76,6 +78,8 @@ target_link_libraries(anima_core PUBLIC
     CUDA::cublas
     CUDA::cublasLt
     CUDA::curand
+    CUDA::cuda_driver
+    CUDA::nvrtc
     ${CUDNN_LIB}
     ${SENTENCEPIECE_LIB}
 )

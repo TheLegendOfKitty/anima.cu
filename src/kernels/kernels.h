@@ -259,3 +259,20 @@ void cfg_euler_a_rf_step_bf16(
     float cfg_scale, float sigma, float sigma_next,
     float eta, float s_noise,
     int64_t N, cudaStream_t stream = 0);
+
+// ---- Fused CFG + ER-SDE Full Step (multi-stage) ----
+void cfg_er_sde_full_step_bf16(
+    __nv_bfloat16* x,
+    const __nv_bfloat16* noise_pos,
+    const __nv_bfloat16* noise_neg,
+    __nv_bfloat16* denoised_out,
+    const __nv_bfloat16* old_denoised,
+    __nv_bfloat16* denoised_d_out,
+    const __nv_bfloat16* old_denoised_d,
+    const __nv_bfloat16* rand_noise,
+    float cfg_scale, float sigma,
+    float A, float B,
+    float d_scale, float coeff2,
+    float u_scale, float coeff3,
+    float noise_coeff,
+    int64_t N, cudaStream_t stream = 0);
